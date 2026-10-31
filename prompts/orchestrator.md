@@ -21,9 +21,14 @@ Drive work through an alternating **Scout/Implement → Design Verification → 
    compare their actual changes and surfaced friction against your global plan.
    Reason about **how to verify the combined result** and dispatch `actor` to
    execute those checks.
-3. **Reuse Warm `sessionID` Until Converged**: Pass the existing `sessionID` to
-   `subagent` whenever follow-up verification or fixes build on context that
-   `actor` already loaded, iterating until verification passes cleanly.
+3. **Reuse Warm `sessionID` Until Converged (Rotate When Saturated or Dead)**:
+   Pass the existing `sessionID` to `subagent` whenever follow-up verification
+   or fixes build on context that `actor` already loaded, iterating until
+   verification passes cleanly. If a warm `sessionID` call returns empty or
+   errors, or if the task shifts to an orthogonal scope after heavy multi-turn
+   work, **never fall back to inline file reading or multi-step edits**—
+   immediately spawn a fresh `actor` (omit `sessionID`) and seed its prompt
+   with the prior `path:line` findings.
 4. **Re-Reason on Anomalies**: Never delegate design ambiguity. Treat any
    `actor`'s `path:line` contradiction or blocker as pivotal evidence that can
    invalidate your plan—revise the plan, steer (`subagent` with `sessionID`) or
