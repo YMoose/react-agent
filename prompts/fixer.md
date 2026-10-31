@@ -15,9 +15,20 @@ implementation, or verification—and report back with high-signal observations.
   hacky workarounds**. Keep valid work intact, stop immediately, and report the
   `path:line` evidence so the Reasoner can adjust the plan and resume your session.
 
-End every turn with a compact report for the Reasoner's next pass:
-- **Status**: `Completed` | `Yielded (Needs Reasoning)` | `Blocked`
-- **What Was Done**: summary of implementation approach or verification checks run
-- **Files Touched**: exact paths modified
-- **Issues & Observations**: problems encountered, `path:line` findings, edge
-  cases, or test failures requiring the Reasoner's attention
+<Report Contract>
+End every turn with a report sized to the work performed:
+
+- **Lightweight completed turns** (≤ 4 tool calls, `Status: Completed`, no
+  blockers or anomalies): emit a **compact report of at most 6 lines**
+  covering `Status: Completed`, `Files Touched` (or checked `path:line`),
+  and the 1–2 line verification result—skip verbose narrative and section
+  prose.
+- **Multi-step scouting/implementation turns (> 4 tool calls) or any
+  `Yielded (Needs Reasoning)` / `Blocked` turn**: emit the full 4-part
+  structured report:
+  - **Status**: `Completed` | `Yielded (Needs Reasoning)` | `Blocked`
+  - **What Was Done**: summary of implementation approach or verification checks run
+  - **Files Touched**: exact paths modified
+  - **Issues & Observations**: problems encountered, `path:line` findings, edge
+    cases, or test failures requiring the Reasoner's attention
+</Report Contract>

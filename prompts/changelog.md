@@ -7,6 +7,40 @@ entries are sanitized of private paths, credentials, and raw user transcripts.
 
 ---
 
+## v3.2 — `fixer.md`: Adaptive Compact Reporting for Light Turns
+
+- **Date**: 2026-10-31
+- **Files Changed**: `prompts/fixer.md` (`<Report Contract>`)
+- **Trigger / Evidence**:
+  - In `ses_e730e619…` at dispatch boundary `k=4`, Reasoner reused a warm
+    Actor for a lightweight verification check (`4` tool calls, `8,493` raw
+    tool output chars, $\Delta\mathrm{Ctx} = 4,995$ tokens). Because `fixer.md`
+    v2 mandated a fixed 4-section report regardless of turn weight, Actor
+    emitted a `1,101`-token report, compressing $\mathrm{NCR}_{\text{char}}$
+    down to `2.90:1` and $\mathrm{NCR}_{\text{ctx}}$ to `4.54:1` (`MODERATE_GAIN`).
+  - Across `ses_e730e0ee…` (`k=1..5`), `6,608` of the child's `15,597` visible
+    output tokens (`42%`) were spent generating report prose. Similarly, on
+    short `3–4` tool turns in `ses_e6f8614a…` (`k=4, 5`), fixed 4-part reports
+    cost `976` and `1,141` tokens respectively.
+- **Target Economics / Boundary**:
+  - **Inequality Terms**: Directly lowers right-hand boundary communication
+    generation tax $C_{\text{tx}} = (T_{\text{dispatch}} + T_{\text{report}}) \cdot c_{\text{out}}$
+    and reduces context leak ratio $\sigma_{\text{leak}} = 1 / \mathrm{NCR}$,
+    thereby increasing left-hand noise isolation $\Delta T_{\text{noise}} = \Delta T_{\text{Actor\_raw}} - T_{\text{report}}$.
+  - **Three-Cut Boundary**: Targets **Cut B** (Actor return generation) and
+    **Cut C** (report token injection into Reasoner's context window).
+- **Expected Metric Impact**:
+  - **M10 (Adaptive Report Compactness)**: Cut $T_{\text{report}}$ on
+    lightweight completed turns ($\le 4$ tool calls) from `~1,000–1,150`
+    tokens to `< 300` tokens ($\le 6$ lines).
+  - **M1 (NCR)**: Raise light-turn $\mathrm{NCR}_{\text{ctx}}$ above `8:1`
+    (`HIGH_GAIN`).
+  - **M4 (Handoff Essay Friction Share)**: Reduce $\mathrm{Friction}_{\text{child}}$
+    below `25%` while retaining the full 4-part report on $>4$-tool or
+    `Yielded`/`Blocked` turns to preserve `0` rework on **M3/M6**.
+
+---
+
 ## v3.1 — `orchestrator.md`: Warm-Session Failure & Saturation Rotation Rule
 
 - **Date**: 2026-10-31
