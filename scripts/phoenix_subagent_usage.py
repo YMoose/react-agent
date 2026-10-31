@@ -550,14 +550,33 @@ def classify_launch(result_text: str) -> tuple[str, str | None, str | None]:
     ``background`` parameter, which is empirically absent on async launches too.
     Patterns mirror ``oh-my-opencode-slim/src/utils/task.ts``: the v2 native
     background sentence and the v1 byte-stable running placeholder.
+
+    Anchoring (Bug A fix, 2026-10-31): a ``<subagent sessionID=… state=…>``
+    wrapper at position 0 is the authoritative *terminal* marker of a sync
+    dispatch.  Quoted examples of async patterns deeper inside the report body
+    (e.g. an actor's ``task_*`` scouting report literally documenting
+    ``<task id="…" state="running">``) must NOT flip the classification to
+    async — so the async patterns are matched only at the start of the result,
+    where a real launch handle lives, and the outer wrapper is checked first.
     """
-    m = NATIVE_BACKGROUND_RE.search(result_text)
+    text = result_text.lstrip()
+    # outer terminal wrapper at position 0 wins outright
+    m = SUBAGENT_WRAPPER_RE.match(text)
+    if m:
+        return "sync", m.group(1), m.group(2)
+    if text.startswith("<subagent"):
+        # wrapper present but truncated/malformed — still a terminal sync result
+        _, state = decode_tool_result(text)
+        return "sync", None, state
+    # async launch handles occupy the start of the result text
+    m = NATIVE_BACKGROUND_RE.match(text)
     if m:
         return "async", m.group(1), "running"
-    m = RUNNING_TASK_TAG_RE.search(result_text)
+    m = RUNNING_TASK_TAG_RE.match(text)
     if m:
         return "async", m.group(1), "running"
-    m = SUBAGENT_WRAPPER_RE.search(result_text)
+    # terminal sync wrapper anywhere else in the text (unusual prefix)
+    m = SUBAGENT_WRAPPER_RE.search(text)
     if m:
         return "sync", m.group(1), m.group(2)
     return "sync", None, None
@@ -754,6 +773,12 @@ class DispatchBoundary:
     has_issues_section: bool = False
     t_report_exact: int | None = None  # Δin(R_k+1) − in(R_k) − out(R_k)
     t_report_est: int = 0
+    # Bug C fix (2026-10-31): Δin between R_prev and R_consume can absorb host
+    # injections (server-restart recovery prompts, <system-update> catalog
+    # swaps, dropped-span turn churn).  When exact wildly exceeds the report's
+    # own char-based estimate, mark it polluted and fall back to the estimate.
+    t_report_polluted: bool = False
+    t_report_effective: int = 0  # exact when trustworthy, est otherwise
     # economics
     ncr_char: float | None = None
     ncr_ctx: float | None = None
@@ -799,6 +824,8 @@ class DispatchBoundary:
             "has_issues_section": self.has_issues_section,
             "t_report_exact": self.t_report_exact,
             "t_report_est": self.t_report_est,
+            "t_report_polluted": self.t_report_polluted,
+            "t_report_effective": self.t_report_effective,
             "ncr_char": round(self.ncr_char, 2) if self.ncr_char else None,
             "ncr_ctx": round(self.ncr_ctx, 2) if self.ncr_ctx else None,
             "n_rem": self.n_rem,
@@ -1211,10 +1238,39 @@ def build_economics(
                     if rec.warm and prev_ctx:
                         rec.t_dispatch_exact = max(u_first["input_tokens"] - prev_ctx, 0)
 
+            # Bug B fix (2026-10-31): a sync dispatch that returned an empty
+            # result AND shows zero child LLM activity in its window is a
+            # failed resume/dispatch (e.g. warm session unresumable after
+            # context saturation — ses_e799a9c6 k=5, 0s / empty result).
+            # Surface it as an error boundary instead of a silent UNKNOWN.
+            if rec.mode == "sync" and not report.strip() and rec.actor_llm_n == 0:
+                rec.protocol_state = "error"
+                rec.status = "Resume/Dispatch Failed (Empty)"
+                rec.verdict = "FAILED_DISPATCH"
+
+            # Bug C fix (2026-10-31): plausibility gate on the exact Δin.
+            # Host injections between R_prev and R_consume (restart recovery
+            # prompts, <system-update> catalog swaps, dropped-span churn —
+            # ses_e7063a72 k=1 gained ~5.4k tok of them) inflate t_report_exact
+            # far beyond the report's own char estimate.  When exact exceeds
+            # 2× the estimate by more than 1,500 tokens, trust the estimate;
+            # keep the raw exact for diagnostic transparency.
+            if (
+                rec.t_report_exact is not None
+                and rec.t_report_exact > 2.0 * rec.t_report_est
+                and (rec.t_report_exact - rec.t_report_est) > 1500
+            ):
+                rec.t_report_polluted = True
+                rec.t_report_effective = rec.t_report_est
+            else:
+                rec.t_report_effective = (
+                    rec.t_report_exact if rec.t_report_exact is not None else rec.t_report_est
+                )
+
             # ratios
             if rec.report_chars and rec.actor_raw_result_chars:
                 rec.ncr_char = rec.actor_raw_result_chars / rec.report_chars
-            report_tok = rec.t_report_exact if rec.t_report_exact is not None else rec.t_report_est
+            report_tok = rec.t_report_effective
             if rec.actor_absorbed_tokens is not None and report_tok:
                 rec.ncr_ctx = rec.actor_absorbed_tokens / report_tok
             if report_tok:  # unknown T_report (undelivered async) ⇒ savings unknowable
@@ -1223,7 +1279,9 @@ def build_economics(
                 rec.compounded_saved = rec.n_rem * rec.dt_noise_tokens
 
             score = rec.ncr_ctx if rec.ncr_ctx is not None else rec.ncr_char
-            if score is None:
+            if rec.verdict == "FAILED_DISPATCH":
+                pass  # already classified by the Bug B gate above
+            elif score is None:
                 rec.verdict = "UNKNOWN"
             elif rec.status in ("yielded", "blocked"):
                 rec.verdict = "HANDOFF_RETRY"
@@ -1274,10 +1332,10 @@ def build_economics(
             entry["t_dispatch_total"] += rec.t_dispatch_est
         if rec.t_report_exact is not None:
             entry["t_report_exact"] += rec.t_report_exact
-            entry["t_report_total"] += rec.t_report_exact
-        else:
+        if rec.t_report_effective == rec.t_report_est:
+            # no exact measurement, or exact was polluted → estimate is effective
             entry["t_report_est"] += rec.t_report_est
-            entry["t_report_total"] += rec.t_report_est
+        entry["t_report_total"] += rec.t_report_effective
         entry["report_chars"] += rec.report_chars
         entry["raw_chars"] += rec.actor_raw_result_chars
         entry["absorbed"] += rec.actor_absorbed_tokens or 0
@@ -1286,7 +1344,11 @@ def build_economics(
             entry["children"].add(rec.child_session)
         entry["statuses"][rec.status] += 1
         entry["verdicts"][rec.verdict] += 1
-        if rec.status in ("yielded", "blocked") or rec.verdict in ("HANDOFF_RETRY", "MARGINAL_OVERHEAD"):
+        if rec.status in ("yielded", "blocked") or rec.verdict in (
+            "HANDOFF_RETRY",
+            "MARGINAL_OVERHEAD",
+            "FAILED_DISPATCH",
+        ):
             entry["rework"] += 1
         if rec.mode == "async":
             entry["async"] += 1
@@ -1464,6 +1526,8 @@ def render_economics(econ: dict[str, Any], chars_per_token: float) -> str:
                 if rec.t_report_exact is not None
                 else f"~{rec.t_report_est}"
             )
+            if rec.t_report_polluted:
+                t_rep += "⚠"  # exact Δin polluted by host injections → est effective
             ncr_char = f"{rec.ncr_char:.2f}" if rec.ncr_char is not None else "-"
             ncr_ctx = f"{rec.ncr_ctx:.2f}" if rec.ncr_ctx is not None else "-"
             absorbed = (
@@ -1537,6 +1601,7 @@ def render_economics(econ: dict[str, Any], chars_per_token: float) -> str:
                 + (" (Issues & Observations present)" if rec.has_issues_section else "")
                 + (
                     f", exact injected {rec.t_report_exact:,} tok"
+                    + (" ⚠polluted → est effective" if rec.t_report_polluted else "")
                     if rec.t_report_exact is not None
                     else ""
                 )
