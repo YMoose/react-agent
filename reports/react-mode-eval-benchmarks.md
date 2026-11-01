@@ -85,3 +85,18 @@ python3 obsystem/react-agent/scripts/phoenix_subagent_usage.py \
 1. **工具注册与符号对齐**：检查首条 LLM Span `input.value` 的 `tools` 数组是否包含 `subagent`（脚本缺失时打 `⚠` 警告），并确认提示词中的工具/参数名（`subagent` / `agent` / `sessionID`）与宿主 Schema 一致（如 v2 宿主不存在 v1 的 `task_message`）。
 2. **豁免口过宽**：检查切面 A 的 `opencode.reasoning` 是否逐字引用了提示词中的宽泛豁免条款（如 *"Handle trivial, self-contained edits directly"*）进行自我豁免。
 3. **首步滑坡（First-Step Inertia）**：检查父会话首个 TOOL Span 是否为亲自调用的 `read` / `shell`——一旦主会话为“先看一眼好写规格”而亲自读盘，后续极易顺着上下文惯性一路单干到底。
+
+---
+
+## 四、2026-10-31 附录：盲区 D/E/F 分析器扩展回归（`ocg-obs`）
+
+对应规范 `reports/react-mode-eval.md` 同日修订：M1 片段内乘子 $N_{\text{rem}}^{\text{ep}}$、M2/M4 子会话饱和水线、M3 内联逃逸 $C_{\text{escape}}$ 与孤儿子会话沉没成本。新增 CLI：`--child-peak-warn 120000` / `--episode-gap-min 30` / `--in-flight-window-sec 600`；JSON 载荷新增 `child_saturation` / `orphan_children` / `params`。回归对照会话 `ses_e799a9c6…`（k1–k6）与 `ses_e7063a72…`：
+
+| 盲区 | 回归判定 | 实测结果 |
+|---|---|---|
+| **D 子会话饱和水线** | `ses_e70bb348…`（`A_old`，`ses_e799a9c6…` 之子）Peak(A) 判 `CHILD_OVERLOADED (Rotate Session)` | **274,198 tok ≥ 120k ⚠rotate**（M4 账单行打标；水线表同时捕获 219,348 / 207,989 两个越线子会话）；k=5 后下一次热派发 0s `FAILED_DISPATCH`，与"越线后强制热复用即崩"一致 |
+| **E-① 片段内乘子** | `ses_e799a9c6…` k=1 的 `N_rem ep/raw` 与终止因 | **8/46，`end=idle_gap`**（原始跨片段计数虚增 ~5.75×）；全会话复利节省改按 $\sum N_{\text{rem}}^{\text{ep}} \cdot \Delta T_{\text{noise}}$ 口径输出 |
+| **E-② 内联逃逸** | k=5（0s 失败）后的父会话内联逃逸窗归属 | **12 次内联工具、59 min、ΔCtx=+148,729 tok** 全部归属 k=5（`inline_escape_ctx_delta/tools/duration_s`），汇总行 `Σ C_escape ≈ +148,729 tok` |
+| **F 孤儿/在途** | `ses_e706375e7…`（父 `ses_e7063a72…` 重启丢 Span）与在途分类 | `ses_e706375e7…` 判 **`orphan_aborted_or_dropped`**（age 829 min，沉没 57,217 tok 计入 `C_rework`）；`in_flight_pending_parent` 分支经合成夹具验证（近期活跃 + 父静默 → 在途；老化 → 孤儿；父 `subagent` Span 窗口覆盖 → 无孤儿），当前快照无真实在途样本 |
+
+> 已知边界：`in_flight_pending_parent` 依赖 trace 水位内 ≤600s 的活跃度，仅在分析时刻确有阻塞中同步派发才会出现；`orphan` 的 `age_s` 以全 trace 最大 Span 终点为水位基准。

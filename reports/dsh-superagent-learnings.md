@@ -108,7 +108,7 @@ Main Router Session（orchestrator）        ≈ Reasoner（只路由，无侦�
 
 **证据**：`orchestrator_thread_follow` 让工单订阅关联线程"仅作上下文"——消息照常送达，但"**不借予 follow-up 强度、不能唤醒已结束工单**"（`dsh:src/app/tools/executor.ts:51-52`，`dsh:docs/007-architecture.md:90`）；投递卡片显式携带 `context: true` 标记（`dsh:src/executor/dsh.ts:156-159`）。
 
-**对我们的细化**：这是"授权（Mandate）与上下文（Subscription）正交分解"的范本——群聊范式的 $\sigma_{\text{leak}}=1\sim M$ 灾难（`eval.md` 第 1.3 节范式 6）被驯服为**单向、带标记、无行动权**的观察流。我们的多工单场景（如同一仓库多个并行 Actor）中，跨工单上下文共享目前只能靠 Reasoner 转述（吃 $C_{\text{tx}}$）；context-only 订阅提供了零授权泄漏的第三径。
+**对我们的细化**：这是"授权（Mandate）与上下文（Subscription）正交分解"的范本——群聊范式的 $\sigma_{\text{leak}}=1\sim M$ 灾难（`eval.md` 第 2.3 节范式 6）被驯服为**单向、带标记、无行动权**的观察流。我们的多工单场景（如同一仓库多个并行 Actor）中，跨工单上下文共享目前只能靠 Reasoner 转述（吃 $C_{\text{tx}}$）；context-only 订阅提供了零授权泄漏的第三径。
 
 ### 2.5 `MEDIUM_MUTATE` 的单写者铁律与无授权便签（`orchestrator_ticket_note`）
 
