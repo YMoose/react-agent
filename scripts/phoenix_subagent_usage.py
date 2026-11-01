@@ -44,6 +44,17 @@ child execution window runs from launch to the report delivery point
 ``task_status(result=true)`` pull, the next re-dispatch, or the child's
 last span), and Δt_parallel = Σ child_exec − merged window union.
 
+Native-notification delivery is resolved from the parent's untruncated wire
+JSONL: inside serialized request bodies the wrapper quotes are JSON-escaped
+(a plain-quote regex never matches), and the wrapper persists in every later
+request, so delivery = the first post-launch frame whose occurrence count
+for the child exceeds the count at launch (a warm re-dispatch of the same
+child adds a second wrapper). The same wire log rescues completed dispatches
+whose parent ``execute_tool subagent`` TOOL span was dropped by the exporter
+(they would otherwise be miscounted as orphan waste), alongside the
+self-acquired context growth ΔPeak_self = Peak − in(R_1) that separates
+sessions born with a huge first prompt from self-bloated ones.
+
 All formulas are grounded in OTel GenAI semconv attributes
 (``gen_ai.usage.*``, ``gen_ai.tool.call.*``, ``gen_ai.output.messages``
 reasoning parts) plus the OpenInference/OpenCode bridge attributes
@@ -97,6 +108,16 @@ RUNNING_TASK_TAG_RE = re.compile(r'<task id="([^"]+)" state="running">')
 # host-authored terminal wrapper (sync results AND async completion notifications)
 SUBAGENT_WRAPPER_RE = re.compile(
     r'<subagent sessionID="([^"]+)" state="(\w+)"(?:\s+description="([^"]*)")?\s*>\s*'
+    r"([\s\S]*?)\s*</subagent>"
+)
+# Same wrapper as it appears inside JSON-serialized request bodies (wire
+# frames / `input.value`), where every content quote is backslash-escaped:
+# `<subagent sessionID=\"ses_…\" state=\"completed\">…</subagent>`. The plain
+# regex above never matches this form — this variant does, and its report
+# group is unescaped via a JSON string round-trip.
+SUBAGENT_WRAPPER_ESCAPED_RE = re.compile(
+    r'<subagent sessionID=\\"([^\\"]+)\\" state=\\"(\w+)\\"'
+    r'(?:\s+description=\\"([^\\"]*)\\")?\s*>\s*'
     r"([\s\S]*?)\s*</subagent>"
 )
 WAITING_INPUT_RE = re.compile(r"waiting_input:\s*true\s*\((\w+)\s+(\S+)\)")
@@ -581,13 +602,68 @@ def parse_status(report: str) -> str:
     return "unknown"
 
 
-def child_wrapper_re(child_session: str) -> re.Pattern[str]:
-    """Host-authored terminal wrapper for one specific child session."""
-    return re.compile(
-        r'<subagent sessionID="'
-        + re.escape(child_session)
-        + r'" state="(\w+)"(?:\s+description="([^"]*)")?\s*>([\s\S]*?)</subagent>'
-    )
+def subagent_wrappers(body: str, child_session: str | None = None) -> list[dict[str, str]]:
+    """Ordered ``<subagent sessionID=… state=…>…</subagent>`` hits in a body.
+
+    Handles both plain text (tool results, parsed message content) and
+    JSON-serialized request bodies (``input.value`` / wire frames), where the
+    wrapper quotes appear as ``\\"`` escapes; escaped hits are unescaped via a
+    JSON string round-trip. ``child_session`` filters the hits to one child;
+    ``None`` returns every wrapper (any session). Each hit is
+    ``{"sid", "state", "description", "report"}`` in document order, so
+    ``len(hits)`` is the child's wrapper occurrence count in that request —
+    wrappers persist in every later request once delivered.
+    """
+    hits: list[dict[str, str]] = []
+    if not body:
+        return hits
+    chunks: list[str] = [body]
+    if body.lstrip().startswith("{"):
+        try:
+            payload = json.loads(body)
+        except json.JSONDecodeError:
+            payload = None
+        if isinstance(payload, dict) and isinstance(payload.get("messages"), list):
+            chunks = []
+            for msg in payload["messages"]:
+                if not isinstance(msg, dict):
+                    continue
+                content = msg.get("content")
+                if isinstance(content, str):
+                    chunks.append(content)
+                elif isinstance(content, list):
+                    for part in content:
+                        if isinstance(part, dict) and isinstance(part.get("text"), str):
+                            chunks.append(part["text"])
+    for chunk in chunks:
+        for m in SUBAGENT_WRAPPER_RE.finditer(chunk):
+            hits.append(
+                {
+                    "sid": m.group(1),
+                    "state": m.group(2),
+                    "description": m.group(3) or "",
+                    "report": m.group(4),
+                }
+            )
+    if len(chunks) == 1:
+        # raw body that did not parse into messages (truncated span bodies,
+        # non-request JSON): also scan the escaped form directly
+        for m in SUBAGENT_WRAPPER_ESCAPED_RE.finditer(body):
+            try:
+                report = json.loads('"' + m.group(4) + '"')
+            except json.JSONDecodeError:
+                report = m.group(4)
+            hits.append(
+                {
+                    "sid": m.group(1),
+                    "state": m.group(2),
+                    "description": m.group(3) or "",
+                    "report": report,
+                }
+            )
+    if child_session:
+        hits = [h for h in hits if h["sid"] == child_session]
+    return hits
 
 
 def classify_launch(result_text: str) -> tuple[str, str | None, str | None]:
@@ -675,14 +751,21 @@ def snippet(text: str, limit: int) -> str:
     return flat[:limit] + ("…" if len(flat) > limit else "")
 
 
-def load_wire_frames(wire_dir: Path | None, session_id: str) -> dict[str, str]:
-    """seq → raw request frame for one session, from the plugin's untruncated JSONL sink."""
+def load_wire_records(wire_dir: Path | None, session_id: str) -> list[dict[str, Any]]:
+    """Chronological wire records for one session: ``[{seq, ts, ts_dt, frame}]``.
+
+    One record per untruncated request frame from the plugin's JSONL sink.
+    Records are ordered by their own ``ts`` — NOT by ``seq``: the JSONL seq
+    counter resets across host restarts (and is a different namespace than
+    the spans' ``opencode.wire.seq`` attribute), so file order + ``ts`` is
+    the only reliable chronology.
+    """
     if not wire_dir:
-        return {}
+        return []
     path = wire_dir / f"{session_id}.jsonl"
-    frames: dict[str, str] = {}
+    records: list[dict[str, Any]] = []
     if not path.exists():
-        return frames
+        return records
     try:
         with path.open(encoding="utf-8", errors="replace") as fh:
             for line in fh:
@@ -693,13 +776,22 @@ def load_wire_frames(wire_dir: Path | None, session_id: str) -> dict[str, str]:
                     rec = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                seq = rec.get("seq")
                 frame = rec.get("frame")
-                if seq is not None and isinstance(frame, str):
-                    frames[str(seq)] = frame
+                if not isinstance(frame, str):
+                    continue
+                ts = rec.get("ts")
+                records.append(
+                    {
+                        "seq": rec.get("seq"),
+                        "ts": ts if isinstance(ts, str) else "",
+                        "ts_dt": tso(ts) if isinstance(ts, str) else None,
+                        "frame": frame,
+                    }
+                )
     except OSError:
-        return {}
-    return frames
+        return []
+    records.sort(key=lambda r: r["ts"])
+    return records
 
 
 def wire_body(attrs: dict[str, Any], frames: dict[str, str]) -> tuple[str, bool, str]:
@@ -790,6 +882,7 @@ class SessionBill:
     roles: set[str] = field(default_factory=set)
     llm_n: int = 0
     peak_input: int = 0
+    first_turn_input: int = 0  # in(R_1): input tokens of the first LLM call
     tot_input: int = 0
     tot_cache_read: int = 0
     tot_output: int = 0
@@ -804,6 +897,16 @@ class SessionBill:
         return self.tot_output - self.tot_reasoning
 
     @property
+    def delta_peak_self(self) -> int:
+        """ΔPeak_self = Peak − in(R_1): context the session grew itself.
+
+        Separates sessions born with a huge first user prompt (e.g. a 200k
+        spec — Peak ≈ in(R_1), Δ ≈ 0) from sessions that bloated through
+        their own inline tool noise (Peak ≫ in(R_1)).
+        """
+        return max(self.peak_input - self.first_turn_input, 0)
+
+    @property
     def cache_hit_pct(self) -> float:
         return self.tot_cache_read / self.tot_input * 100 if self.tot_input else 0.0
 
@@ -813,6 +916,8 @@ class SessionBill:
             "roles": sorted(self.roles),
             "llm_calls": self.llm_n,
             "peak_input_tokens": self.peak_input,
+            "first_turn_input_tokens": self.first_turn_input,
+            "delta_peak_self": self.delta_peak_self,
             "total_input_tokens": self.tot_input,
             "total_cache_read_input_tokens": self.tot_cache_read,
             "cache_hit_pct": round(self.cache_hit_pct, 1),
@@ -1023,6 +1128,8 @@ def build_economics(
             if kind == "llm" or span.get("name", "").startswith("chat "):
                 u = usage_of(attrs)
                 bill.llm_n += 1
+                if bill.llm_n == 1:
+                    bill.first_turn_input = u["input_tokens"]
                 bill.peak_input = max(bill.peak_input, u["input_tokens"])
                 bill.tot_input += u["input_tokens"]
                 bill.tot_cache_read += u["cache_read_input_tokens"]
@@ -1037,6 +1144,14 @@ def build_economics(
                 if tname == "read":
                     bill.reads.append(read_call_of(span, attrs))
         bills[sid] = bill
+
+    # ---- untruncated wire records (one JSONL per session, cached once) ------
+    wire_cache: dict[str, list[dict[str, Any]]] = {}
+
+    def wire_records_of(session: str) -> list[dict[str, Any]]:
+        if session not in wire_cache:
+            wire_cache[session] = load_wire_records(wire_dir, session)
+        return wire_cache[session]
 
     # ---- task_* control-plane events (polls, pulls, escalations, cancels) ----
     task_events: dict[str, dict[str, Any]] = {}
@@ -1136,12 +1251,17 @@ def build_economics(
             for s, a in items
             if tso(s.get("startTime", "")) and is_compaction_span(s, a)
         )
-        wire_frames = load_wire_frames(wire_dir, sid)
+        wire_records = wire_records_of(sid)
+        wire_frames = {str(wr["seq"]): wr["frame"] for wr in wire_records}
         # task_status(result=true) pulls indexed by target session for this parent
         pulls_by_child: dict[str, list[dict[str, Any]]] = {}
         for evt in task_events.get(sid, {}).get("pulls", []):
             if evt["target"]:
                 pulls_by_child.setdefault(evt["target"], []).append(evt)
+        # Bug 1 (2026-11-01): highest wrapper occurrence index already claimed
+        # per child by an earlier dispatch of this parent — a warm re-dispatch
+        # of the same child must resolve to ITS OWN (later) wrapper.
+        wire_claimed: dict[str, int] = {}
         # §4.2.4 [M2]: every child session of this parent — used to detect
         # cold-spawn cross-child re-reads against prior dispatch windows.
         child_siblings = {c for c, p in child_parent.items() if p == sid}
@@ -1184,44 +1304,123 @@ def build_economics(
 
             # --- async completion resolution ----------------------------------
             terminal_t: datetime | None = None
-            consume_span: tuple[dict[str, Any], dict[str, Any]] | None = None
+
+            def link_consume(rdt: datetime) -> None:
+                """Attach the parent LLM span that sent the wrapper-bearing
+                request (logged at ``rdt``) and measure exact T_report =
+                Δin(R_consume) − in(R_prev) − out_vis(R_prev).
+
+                The frame ``ts`` marks request-send time, so the sending span
+                is the last parent LLM span that STARTED at/before it. When
+                Phoenix dropped that span, exact measurement is skipped and
+                the char-based estimate remains authoritative."""
+                nonlocal terminal_t
+                for idx in range(len(parent_llm) - 1, -1, -1):
+                    llm_span, llm_attrs = parent_llm[idx]
+                    s0 = tso(llm_span.get("startTime", ""))
+                    if s0 is None or s0 > rdt + timedelta(seconds=1):
+                        continue
+                    if idx > 0:
+                        prev_u = usage_of(parent_llm[idx - 1][1])
+                        cur_u = usage_of(llm_attrs)
+                        prev_out_vis = max(
+                            prev_u["output_tokens"]
+                            - prev_u["reasoning_output_tokens"],
+                            0,
+                        )
+                        exact = (
+                            cur_u["input_tokens"]
+                            - prev_u["input_tokens"]
+                            - prev_out_vis
+                        )
+                        rec.t_report_exact = exact if exact >= 0 else None
+                        rec.r_consume_in = cur_u["input_tokens"]
+                        rec.r_consume_start = llm_span.get("startTime", "")
+                    break
+
             if rec.mode == "async":
                 rec.report_delivery = "none"
-                # (a) native completion notification in a later parent request
+                # (a) native completion notification in a later parent request.
+                # Phoenix's input.value truncates at 60 KiB and the wrapper
+                # quotes are JSON-escaped inside serialized request bodies, so
+                # the plain-regex scan of span bodies almost never hits. Scan
+                # the FULL wire record list instead, in file/``ts`` order (the
+                # JSONL seq counter resets across host restarts and is not the
+                # spans' ``opencode.wire.seq`` namespace). The wrapper persists
+                # in every later request, so delivery = the first post-launch
+                # frame whose occurrence count for this child EXCEEDS the
+                # count at launch (a warm re-dispatch adds a 2nd wrapper).
                 if rec.child_session:
-                    wpat = child_wrapper_re(rec.child_session)
-                    for idx, (llm_span, llm_attrs) in enumerate(parent_llm):
-                        s0 = tso(llm_span.get("startTime", ""))
-                        if not s0 or not t0 or s0 < t0:
+                    esc_open = '<subagent sessionID=\\"' + rec.child_session + '\\"'
+                    plain_open = '<subagent sessionID="' + rec.child_session + '"'
+
+                    def wire_count(wr: dict[str, Any]) -> int:
+                        return wr["frame"].count(esc_open) + wr["frame"].count(plain_open)
+
+                    baseline = 0
+                    for wr in wire_records:
+                        rdt = wr["ts_dt"]
+                        if rdt and t0 and rdt <= t0:
+                            baseline = wire_count(wr)
+                    required = max(
+                        baseline + 1, wire_claimed.get(rec.child_session, 0) + 1
+                    )
+                    for wr in wire_records:
+                        rdt = wr["ts_dt"]
+                        if not rdt or not t0 or rdt <= t0:
                             continue
-                        body, _, _ = wire_body(llm_attrs, wire_frames)
-                        wm = wpat.search(body or "")
-                        if wm:
+                        if wire_count(wr) < required:
+                            continue
+                        hits = subagent_wrappers(wr["frame"], rec.child_session)
+                        if len(hits) < required:
+                            continue  # opening-tag count disagreed with the parse
+                        hit = hits[required - 1]
+                        wire_claimed[rec.child_session] = required
+                        rec.report_delivery = "native_notification"
+                        rec.protocol_state = hit["state"]
+                        report_text = hit["report"].strip()
+                        if report_text.startswith("[") or report_text.startswith('"'):
+                            report_text, _ = decode_tool_result(report_text)
+                        result_text = report_text
+                        terminal_t = rdt
+                        rec.r_consume_start = wr["ts"]
+                        link_consume(rdt)
+                        break
+                else:
+                    # child id only resolvable at delivery time: take the
+                    # first post-launch wrapper that no earlier dispatch of
+                    # this parent claimed, preferring a description match
+                    claimed = {
+                        d.child_session
+                        for d in dispatches
+                        if d.parent_session == sid and d.child_session
+                    } | set(wire_claimed)
+                    for wr in wire_records:
+                        rdt = wr["ts_dt"]
+                        if not rdt or not t0 or rdt <= t0:
+                            continue
+                        for hit in subagent_wrappers(wr["frame"], None):
+                            if hit["sid"] in claimed:
+                                continue
+                            if (
+                                rec.description
+                                and hit["description"]
+                                and hit["description"] != rec.description
+                            ):
+                                continue
+                            rec.child_session = hit["sid"]
+                            wire_claimed[hit["sid"]] = 1
                             rec.report_delivery = "native_notification"
-                            rec.protocol_state = wm.group(1)
-                            report_text = wm.group(3).strip()
+                            rec.protocol_state = hit["state"]
+                            report_text = hit["report"].strip()
                             if report_text.startswith("[") or report_text.startswith('"'):
                                 report_text, _ = decode_tool_result(report_text)
                             result_text = report_text
-                            terminal_t = s0
-                            consume_span = (llm_span, llm_attrs)
-                            # exact T_report: Δin(R_consume) − in(prev) − out_vis(prev)
-                            if idx > 0:
-                                prev_u = usage_of(parent_llm[idx - 1][1])
-                                cur_u = usage_of(llm_attrs)
-                                prev_out_vis = max(
-                                    prev_u["output_tokens"]
-                                    - prev_u["reasoning_output_tokens"],
-                                    0,
-                                )
-                                exact = (
-                                    cur_u["input_tokens"]
-                                    - prev_u["input_tokens"]
-                                    - prev_out_vis
-                                )
-                                rec.t_report_exact = exact if exact >= 0 else None
-                                rec.r_consume_in = cur_u["input_tokens"]
-                                rec.r_consume_start = llm_span.get("startTime", "")
+                            terminal_t = rdt
+                            rec.r_consume_start = wr["ts"]
+                            link_consume(rdt)
+                            break
+                        if terminal_t is not None:
                             break
                 # (b) task_status(result=true) pull for this child
                 if (
@@ -1692,6 +1891,37 @@ def build_economics(
                 break
         if covered:
             continue
+        # Bug 2 (2026-11-01): the exporter sometimes drops the parent
+        # `execute_tool subagent` TOOL span while the child completed normally
+        # and its `<subagent sessionID=… state=completed">…</subagent>` wrapper
+        # IS present in the parent's wire log. Such children are delivered
+        # dispatches missing only their Phoenix coverage — never orphan waste.
+        wire_covered = False
+        if pid:
+            esc_open = '<subagent sessionID=\\"%s\\"' % sid
+            plain_open = '<subagent sessionID="%s"' % sid
+            for wr in wire_records_of(pid):
+                if esc_open in wr["frame"] or plain_open in wr["frame"]:
+                    wire_covered = True
+                    break
+        if wire_covered:
+            bill = bills.get(sid)
+            consumed = (bill.tot_input + bill.tot_output) if bill else 0
+            orphan_children.append(
+                {
+                    "session_id": sid,
+                    "parent_id": pid,
+                    "classification": "delivered_missing_tool_span",
+                    "age_s": None,
+                    "first_span": items[0][0].get("startTime", ""),
+                    "last_span_end": max(
+                        (s.get("endTime", "") for s, _ in items), default=""
+                    ),
+                    "llm_n": bill.llm_n if bill else 0,
+                    "consumed_tokens": consumed,
+                }
+            )
+            continue
         # uncovered → classify by recency + parent silence after child start
         # Liveness / in-flight guard: an uncovered child whose latest activity
         # lies within CHILD_LIVE_WINDOW_SEC of the trace horizon is still
@@ -1882,20 +2112,27 @@ def render_economics(econ: dict[str, Any], chars_per_token: float) -> str:
     lines.append("### Metric 4 — token & latency bill (per session)")
     lines.append("")
     lines.append(
-        "| session | role | llm | peak input | tot input | cache read | cache% "
-        "| out | reasoning | visible |"
+        "| session | role | llm | peak input | in(R₁) | Δpeak_self "
+        "| tot input | cache read | cache% | out | reasoning | visible |"
     )
-    lines.append("|---|---|---|---|---|---|---|---|---|---|")
+    lines.append("|---|---|---|---|---|---|---|---|---|---|---|---|")
     for bill in sorted(bills.values(), key=lambda b: b.first):
         if not bill.llm_n:
             continue
         lines.append(
             f"| `{bill.session_id[:20]}…` | {','.join(sorted(bill.roles)) or '-'} "
             f"| {bill.llm_n} | {bill.peak_input:,}{' ⚠rotate' if bill.session_id in overloaded_ids else ''} "
+            f"| {bill.first_turn_input:,} | +{bill.delta_peak_self:,} "
             f"| {bill.tot_input:,} "
             f"| {bill.tot_cache_read:,} | {bill.cache_hit_pct:.0f}% "
             f"| {bill.tot_output:,} | {bill.tot_reasoning:,} | {bill.visible_output:,} |"
         )
+    lines.append("")
+    lines.append(
+        "> Δpeak_self = Peak − in(R₁): context growth the session acquired itself. "
+        "A near-zero Δ on a huge peak means the session was born with a large first "
+        "prompt (spec reload) — not bloated by its own inline tool noise."
+    )
     lines.append("")
 
     # Blind Spot D: child saturation waterline (Peak(A) < τ_rotate)
@@ -2253,7 +2490,11 @@ def render_economics(econ: dict[str, Any], chars_per_token: float) -> str:
             "and parent wrote no newer spans (parent blocked inside a sync `subagent` call whose "
             "TOOL span is still open in memory — window `--in-flight-window-sec`). "
             "`orphan_aborted_or_dropped` = child ended/stale with the covering parent span lost "
-            "(crash/restart); its consumed tokens count as dropped waste in C_rework (M3)."
+            "(crash/restart); its consumed tokens count as dropped waste in C_rework (M3). "
+            "`delivered_missing_tool_span` = child completed and its "
+            "`<subagent sessionID=… state=\"completed\">` wrapper was found in the parent's wire "
+            "log — only the Phoenix `execute_tool subagent` TOOL span was dropped; real delivered "
+            "work, excluded from orphan waste."
         )
         lines.append("")
 
@@ -2280,6 +2521,14 @@ def render_economics(econ: dict[str, Any], chars_per_token: float) -> str:
             lines.append(
                 f"- **orphan dropped waste (C_rework)** ≈ **{orphan_waste:,} tok** consumed by child "
                 "sessions whose covering parent `subagent` span was lost — re-executed work"
+            )
+        wire_recovered = [o for o in orphans if o["classification"] == "delivered_missing_tool_span"]
+        if wire_recovered:
+            recovered_tok = sum(o["consumed_tokens"] for o in wire_recovered)
+            lines.append(
+                f"- **recovered via parent wire log** ≈ {recovered_tok:,} tok across "
+                f"{len(wire_recovered)} completed child dispatch(es) whose parent TOOL span "
+                "was dropped — delivered work confirmed in the wire log, excluded from C_rework"
             )
         lines.append("")
     return "\n".join(lines)
