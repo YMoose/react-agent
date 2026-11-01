@@ -7,6 +7,45 @@ entries are sanitized of private paths, credentials, and raw user transcripts.
 
 ---
 
+## v3.5 — `orchestrator.md`: Sync/Async Background Flag & Outbound Anchor Packing
+
+- **Date**: 2026-11-01
+- **Files Changed**: `prompts/orchestrator.md` (`<ReAct Loop>` Step 1 last sentence refined)
+- **Trigger / Evidence**:
+  - Afternoon `v3.4` telemetry (`2026-11-01 09:02–13:41 UTC`) confirmed the
+    v3.4 wins: `100%` delegation trigger rate (`4/4` sessions), `0`
+    post-compaction inline escapes (`ses_e828c9c15…` delegated immediately
+    after its 12:30 UTC compaction), and `483s` (`50%`) parallel speedup on
+    async lanes — but exposed two Step-1 dispatch friction modes:
+    1. **Under-specified outbound payload** (`ses_e875f3f6d…` `k=3`):
+       Reasoner held a `204k`-token spec in context but dispatched Actor
+       with only *"权威设计依据=spec"* — no anchors or excerpts — forcing the
+       child to re-read `6.29×` the parent's read volume
+       (`RAR = 6.292`, `DSR = 0.137`, vs `DSR = 1.00` on well-anchored
+       dispatches in `ses_e828c9c15…`).
+    2. **Accidental default-background** (`ses_e875f3f6d…` `k=2`): Reasoner
+       omitted `background: false` on a blocking follow-up and was surprised
+       when the harness defaulted it to background async (*"the system put it
+       in background despite my intent"*).
+- **Target Economics / Boundary**:
+  - Targets **Cut A** (Outbound Dispatch Specification) to minimize child
+    reload waste $C_{\text{reload}}$ (`RAR → 0`, `DSR → 1`): premises,
+    write boundaries, and `path:line` anchors/spec excerpts already in
+    Reasoner context are packed into $T_{\text{dispatch}}$ so the child does
+    not re-acquire known information, and to align sync
+    (`CALL_SYNC`, `background: false`) vs async (`CALL_ASYNC`,
+    `background: true`, $C_{\text{poll}} = 0$) control flow with the
+    Reasoner's actual blocking intent.
+- **Expected Metric Impact**:
+  - **M2 (outbound self-sufficiency)**: raise `DSR` above `0.80`
+    (`RAR < 0.25`) on spec-driven dispatches.
+  - **M5 (control-plane cleanliness)**: maintain $C_{\text{poll}} = 0$ with
+    explicit sync/async selection instead of harness defaults.
+  - **M2/M8 (regression guard)**: preserve `v3.4`'s `100%` delegation
+    trigger rate and $C_{\text{escape}} = 0$.
+
+---
+
 ## v3.4 — `orchestrator.md`: Strict Inline Prohibition & Single-Edit Exception
 
 - **Date**: 2026-11-01

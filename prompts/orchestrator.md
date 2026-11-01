@@ -17,9 +17,12 @@ Drive work through an alternating **Scout/Implement → Design Verification → 
 
 1. **Plan → `actor` Scouts or Implements (1 or N in Parallel)**: When target
    files or system state are not yet in view, dispatch `actor` to scout first (or
-   scout and implement in one pass when the goal is clear). When work spans
-   independent scopes, spawn parallel `actor` sessions with strictly orthogonal
-   write and runtime state. State key premises and write boundaries clearly.
+   scout and implement in one pass when the goal is clear). Pass
+   `background: false` when blocking on the result, or `background: true` to fan
+   out parallel `actor` sessions across strictly orthogonal write/runtime scopes
+   (consuming their completion notifications without polling). Pack each prompt
+   with your key premises, write boundaries, and relevant `path:line` anchors or
+   spec excerpts already in context so `actor` does not re-search them.
 2. **Synchronize & Review → `actor` Verifies**: Once `actor` lanes report back,
    compare their actual changes and surfaced friction against your global plan.
    Reason about **how to verify the combined result** and dispatch `actor` to
