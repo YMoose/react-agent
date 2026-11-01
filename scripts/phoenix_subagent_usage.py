@@ -69,7 +69,7 @@ import urllib.error
 import urllib.request
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -131,6 +131,12 @@ DEFAULT_EPISODE_GAP_MIN = 30
 # span is not yet flushed to Phoenix); older uncovered children are orphans
 # (parent span dropped by crash/restart).
 DEFAULT_IN_FLIGHT_WINDOW_SEC = 600
+# Liveness guard: an uncovered child whose last activity lies within this
+# window of the trace horizon is still executing — or its covering parent
+# `subagent` span has not flushed to Phoenix yet (async launches return
+# immediately, so the parent legitimately keeps writing newer spans while
+# the child runs). Such children are `in_flight`, never dropped waste.
+DEFAULT_CHILD_LIVE_WINDOW_SEC = 300
 # Parent inline tools that constitute a post-failure escape streak (C_escape).
 INLINE_TOOLS = {"read", "edit", "write", "shell", "bash", "grep", "glob"}
 
@@ -987,6 +993,7 @@ def build_economics(
     child_peak_warn: int = DEFAULT_CHILD_PEAK_WARN,
     episode_gap_min: int = DEFAULT_EPISODE_GAP_MIN,
     in_flight_window_sec: int = DEFAULT_IN_FLIGHT_WINDOW_SEC,
+    child_live_window_sec: int = DEFAULT_CHILD_LIVE_WINDOW_SEC,
     beta: float = DEFAULT_BETA,
 ) -> dict[str, Any]:
     """Compute the 4-metric scorecard and every dispatch boundary."""
@@ -1686,13 +1693,23 @@ def build_economics(
         if covered:
             continue
         # uncovered → classify by recency + parent silence after child start
-        age_s = (trace_max_end - last_end).total_seconds() if trace_max_end else INF
+        # Liveness / in-flight guard: an uncovered child whose latest activity
+        # lies within CHILD_LIVE_WINDOW_SEC of the trace horizon is still
+        # executing — or its covering parent `subagent` span has not flushed
+        # to Phoenix yet (async launches return immediately, so the parent
+        # legitimately keeps writing newer spans while the child runs).
+        # Classify it `in_flight` and never book it as dropped waste.
+        horizon = trace_max_end or datetime.now(timezone.utc)
+        age_s = (horizon - last_end).total_seconds()
+        live_recent = age_s <= child_live_window_sec
         parent_items = by_session.get(pid) or []
         parent_newer = any(
             (st := tso(s.get("startTime", ""))) and st > first_start for s, _ in parent_items
         )
-        in_flight = age_s <= in_flight_window_sec and not parent_newer
-        cls = "in_flight_pending_parent" if in_flight else "orphan_aborted_or_dropped"
+        in_flight = live_recent or (age_s <= in_flight_window_sec and not parent_newer)
+        cls = "in_flight" if live_recent else (
+            "in_flight_pending_parent" if in_flight else "orphan_aborted_or_dropped"
+        )
         bill = bills.get(sid)
         consumed = (bill.tot_input + bill.tot_output) if bill else 0
         orphan_children.append(
@@ -1834,6 +1851,7 @@ def build_economics(
             "child_peak_warn": child_peak_warn,
             "episode_gap_min": episode_gap_min,
             "in_flight_window_sec": in_flight_window_sec,
+            "child_live_window_sec": child_live_window_sec,
             "beta": beta,
         },
     }
@@ -2228,11 +2246,14 @@ def render_economics(econ: dict[str, Any], chars_per_token: float) -> str:
             )
         lines.append("")
         lines.append(
-            "> `in_flight_pending_parent` = child active recently and parent wrote no newer "
-            "spans (parent blocked inside a sync `subagent` call whose TOOL span is still "
-            "open in memory — window `--in-flight-window-sec`). `orphan_aborted_or_dropped` = "
-            "child ended/stale with the covering parent span lost (crash/restart); its "
-            "consumed tokens count as dropped waste in C_rework (M3)."
+            "> `in_flight` = child active within `--child-live-window-sec` of the trace horizon "
+            "— still executing, or its covering parent `subagent` span has not flushed to "
+            "Phoenix yet (async launches return immediately, so the parent keeps writing newer "
+            "spans); never counted as waste. `in_flight_pending_parent` = child recently active "
+            "and parent wrote no newer spans (parent blocked inside a sync `subagent` call whose "
+            "TOOL span is still open in memory — window `--in-flight-window-sec`). "
+            "`orphan_aborted_or_dropped` = child ended/stale with the covering parent span lost "
+            "(crash/restart); its consumed tokens count as dropped waste in C_rework (M3)."
         )
         lines.append("")
 
@@ -2332,6 +2353,14 @@ def main(argv: list[str] | None = None) -> int:
         f"(default {DEFAULT_IN_FLIGHT_WINDOW_SEC})",
     )
     parser.add_argument(
+        "--child-live-window-sec",
+        type=int,
+        default=DEFAULT_CHILD_LIVE_WINDOW_SEC,
+        help=f"liveness window in seconds: an uncovered child whose last activity lies within "
+        f"this window of the trace horizon (or wall clock) is classified in_flight and "
+        f"excluded from orphan waste (default {DEFAULT_CHILD_LIVE_WINDOW_SEC})",
+    )
+    parser.add_argument(
         "--wire-dir",
         type=Path,
         default=DEFAULT_WIRE_DIR,
@@ -2361,6 +2390,7 @@ def main(argv: list[str] | None = None) -> int:
             child_peak_warn=args.child_peak_warn,
             episode_gap_min=args.episode_gap_min,
             in_flight_window_sec=args.in_flight_window_sec,
+            child_live_window_sec=args.child_live_window_sec,
             beta=args.beta,
         )
 
