@@ -15,17 +15,24 @@ Trigger analytics (original behaviour, unchanged):
 Context-bandwidth economics (new):
 - Metric 1 NCR: noise compression ratio per dispatch, in chars and in exact
   tokens (Actor context absorbed / report tokens injected into Reasoner),
-  plus compounded prefill savings sum(N_rem,k * dT_noise,k)
-- Metric 2: warm session hit rate (sessionID reuse) and an overlap-aware
-  redundant file-read rate (disjoint pagination vs true re-reads)
-- Metric 3: boundary status counts (Completed / Yielded / Blocked) and
-  handoff rework ratio, including task_* control-plane events
+  plus compounded prefill savings Saved_k = N_rem_ep,k * dT_noise,k with
+  dT_noise,k = dT_work,k - T_report,k (spec §4.2.1)
+- Metric 2: warm session hit rate (sessionID reuse), an overlap-aware
+  redundant file-read rate (disjoint pagination vs true re-reads), and the
+  outbound self-sufficiency ratios T_obs / T_reload / RAR / DSR per
+  dispatch (spec §4.2.4)
+- Metric 3: boundary status counts (Completed / Yielded / Blocked / Empty)
+  and handoff rework ratio, including task_* control-plane events
   (task_cancel = explicit plan invalidation, task_reply / waiting_input =
   mid-flight escalations, task_status polling probes)
 - Metric 4: per-session token & latency bill (context peak, cache_read %,
-  visible vs reasoning output) and the Handoff Essay Friction Share
+  visible vs reasoning output), the Handoff Essay Friction Share, and the
+  decode-priced net savings NetSaved_k = Saved_k - beta * (T_dispatch_k +
+  T_report_k) with amortization horizon N*_rem,k (beta = c_out / c_in,
+  spec §4.2.3)
 - Per-dispatch Reasoner<->Actor boundary inspector with economic verdicts
-  (HIGH_GAIN / MODERATE_GAIN / MARGINAL_OVERHEAD / HANDOFF_RETRY)
+  (HIGH_GAIN / MODERATE_GAIN / MARGINAL_OVERHEAD / HANDOFF_RETRY /
+  FAILED_DISPATCH)
 
 Sync and async delegation are both supported. Async launches
 (``subagent(background=true)`` or any result matching omos'
@@ -126,6 +133,11 @@ DEFAULT_EPISODE_GAP_MIN = 30
 DEFAULT_IN_FLIGHT_WINDOW_SEC = 600
 # Parent inline tools that constitute a post-failure escape streak (C_escape).
 INLINE_TOOLS = {"read", "edit", "write", "shell", "bash", "grep", "glob"}
+
+# §4.2.3: output/input price ratio β = c_out / c_in for NetSaved_k / N*_rem,k.
+DEFAULT_BETA = 4.0
+# §4.2.4 [M2]: MEDIUM_OBSERVE tool results counted into T_obs,k.
+OBSERVE_TOOLS = {"read", "grep", "glob"}
 
 INF = float("inf")
 
@@ -714,6 +726,30 @@ class ReadCall:
     out_chars: int
 
 
+def read_interval(rc: ReadCall) -> tuple[float, float]:
+    """Half-open [start, end) line interval of a ``read`` (whole-file ⇒ huge end)."""
+    start = float((rc.offset or 1) - 1)
+    return start, start + (rc.limit if rc.limit is not None else 10**9)
+
+
+def read_call_of(span: dict[str, Any], attrs: dict[str, Any]) -> ReadCall:
+    """Build a ReadCall (path + requested line range) from a `read` TOOL span."""
+    params = dig(attrs, "tool", "parameters") or {}
+    off = params.get("offset")
+    lim = params.get("limit")
+    return ReadCall(
+        ts=span.get("startTime", ""),
+        path=str(params.get("path") or "?"),
+        offset=int(off)
+        if isinstance(off, (int, float, str)) and str(off).lstrip("-").isdigit()
+        else None,
+        limit=int(lim)
+        if isinstance(lim, (int, float, str)) and str(lim).lstrip("-").isdigit()
+        else None,
+        out_chars=len(tool_result_text(attrs)),
+    )
+
+
 def classify_reads(reads: list[ReadCall]) -> dict[str, int]:
     """Overlap-aware redundancy: disjoint pagination vs true re-reads.
 
@@ -727,8 +763,7 @@ def classify_reads(reads: list[ReadCall]) -> dict[str, int]:
     seen_paths: set[str] = set()
     for rc in reads:
         seen_paths.add(rc.path)
-        start = float((rc.offset or 1) - 1)
-        end = start + (rc.limit if rc.limit is not None else 10**9)
+        start, end = read_interval(rc)
         prior = covered[rc.path]
         if prior and any(a <= start and end <= b for a, b in prior):
             stats["redundant"] += 1
@@ -834,7 +869,7 @@ class DispatchBoundary:
     report_state: str | None = None
     status: str = "unknown"
     has_issues_section: bool = False
-    t_report_exact: int | None = None  # Δin(R_k+1) − in(R_k) − out(R_k)
+    t_report_exact: int | None = None  # Δin(R_k+1) − in(R_k) − out_vis(R_k)
     t_report_est: int = 0
     # Bug C fix (2026-10-31): Δin between R_prev and R_consume can absorb host
     # injections (server-restart recovery prompts, <system-update> catalog
@@ -849,10 +884,18 @@ class DispatchBoundary:
     n_rem_ep: int = 0  # episode-bounded: stops at next compaction or idle gap > τ_ep
     episode_end_reason: str | None = None  # compaction | idle_gap | session_end
     dt_noise_tokens: int = 0
-    compounded_saved: int = 0  # N_rem^ep × ΔT_noise (episode-bounded multiplier)
+    compounded_saved: int = 0  # Saved_k = N_rem^ep × ΔT_noise (episode-bounded)
+    # §4.2.3 [M4]: decode-priced net savings + amortization horizon (β = c_out/c_in)
+    net_saved_tokens: int | None = None
+    n_rem_star: float | None = None
     verdict: str = "UNKNOWN"
     # Blind Spot D: session-level peak context of the child (waterline τ_rotate)
     child_peak_input: int | None = None
+    # §4.2.4 [M2]: outbound self-sufficiency (T_obs decomposition, RAR / DSR)
+    t_obs_tokens: int = 0
+    t_reload_tokens: int = 0
+    rar: float | None = None
+    dsr: float | None = None
     # Blind Spot E: post-failure parent inline escape streak (C_escape)
     inline_escape_ctx_delta: int | None = None
     inline_escape_tools: int = 0
@@ -904,7 +947,13 @@ class DispatchBoundary:
             "episode_end_reason": self.episode_end_reason,
             "dt_noise_tokens": self.dt_noise_tokens,
             "compounded_saved": self.compounded_saved,
+            "net_saved_tokens": self.net_saved_tokens,
+            "n_rem_star": self.n_rem_star,
             "child_peak_input": self.child_peak_input,
+            "t_obs_tokens": self.t_obs_tokens,
+            "t_reload_tokens": self.t_reload_tokens,
+            "rar": self.rar,
+            "dsr": self.dsr,
             "inline_escape_ctx_delta": self.inline_escape_ctx_delta,
             "inline_escape_tools": self.inline_escape_tools,
             "inline_escape_duration_s": round(self.inline_escape_duration_s, 1)
@@ -938,6 +987,7 @@ def build_economics(
     child_peak_warn: int = DEFAULT_CHILD_PEAK_WARN,
     episode_gap_min: int = DEFAULT_EPISODE_GAP_MIN,
     in_flight_window_sec: int = DEFAULT_IN_FLIGHT_WINDOW_SEC,
+    beta: float = DEFAULT_BETA,
 ) -> dict[str, Any]:
     """Compute the 4-metric scorecard and every dispatch boundary."""
     parsed = []
@@ -978,18 +1028,7 @@ def build_economics(
                 tname = tool_name_of(span, attrs)
                 bill.tool_counts[tname] += 1
                 if tname == "read":
-                    params = dig(attrs, "tool", "parameters") or {}
-                    off = params.get("offset")
-                    lim = params.get("limit")
-                    bill.reads.append(
-                        ReadCall(
-                            ts=span.get("startTime", ""),
-                            path=str(params.get("path") or "?"),
-                            offset=int(off) if isinstance(off, (int, float, str)) and str(off).lstrip("-").isdigit() else None,
-                            limit=int(lim) if isinstance(lim, (int, float, str)) and str(lim).lstrip("-").isdigit() else None,
-                            out_chars=len(tool_result_text(attrs)),
-                        )
-                    )
+                    bill.reads.append(read_call_of(span, attrs))
         bills[sid] = bill
 
     # ---- task_* control-plane events (polls, pulls, escalations, cancels) ----
@@ -1096,6 +1135,9 @@ def build_economics(
         for evt in task_events.get(sid, {}).get("pulls", []):
             if evt["target"]:
                 pulls_by_child.setdefault(evt["target"], []).append(evt)
+        # §4.2.4 [M2]: every child session of this parent — used to detect
+        # cold-spawn cross-child re-reads against prior dispatch windows.
+        child_siblings = {c for c, p in child_parent.items() if p == sid}
         for k, (span, attrs) in enumerate(sub_spans, 1):
             rec = DispatchBoundary(k=k, parent_session=sid)
             rec.start = span.get("startTime", "")
@@ -1156,14 +1198,19 @@ def build_economics(
                             result_text = report_text
                             terminal_t = s0
                             consume_span = (llm_span, llm_attrs)
-                            # exact T_report: Δin(R_consume) − in(prev) − out(prev)
+                            # exact T_report: Δin(R_consume) − in(prev) − out_vis(prev)
                             if idx > 0:
                                 prev_u = usage_of(parent_llm[idx - 1][1])
                                 cur_u = usage_of(llm_attrs)
+                                prev_out_vis = max(
+                                    prev_u["output_tokens"]
+                                    - prev_u["reasoning_output_tokens"],
+                                    0,
+                                )
                                 exact = (
                                     cur_u["input_tokens"]
                                     - prev_u["input_tokens"]
-                                    - prev_u["output_tokens"]
+                                    - prev_out_vis
                                 )
                                 rec.t_report_exact = exact if exact >= 0 else None
                                 rec.r_consume_in = cur_u["input_tokens"]
@@ -1196,6 +1243,7 @@ def build_economics(
                                         u["input_tokens"],
                                         u["output_tokens"],
                                     )
+                                    rec.r_k_reasoning = u["reasoning_output_tokens"]
                                     break
                             for llm_span, llm_attrs in parent_llm:
                                 s0 = tso(llm_span.get("startTime", ""))
@@ -1204,8 +1252,12 @@ def build_economics(
                                     rec.r_consume_in = rec.r_next_in
                                     rec.r_consume_start = llm_span.get("startTime", "")
                                     if rec.r_k_in is not None:
+                                        r_k_out_vis = max(
+                                            (rec.r_k_out or 0) - (rec.r_k_reasoning or 0),
+                                            0,
+                                        )
                                         rec.t_report_exact = max(
-                                            rec.r_next_in - rec.r_k_in - rec.r_k_out, 0
+                                            rec.r_next_in - rec.r_k_in - r_k_out_vis, 0
                                         )
                                     break
                             terminal_t = pt
@@ -1282,9 +1334,10 @@ def build_economics(
                 rec.n_rem_ep += 1
                 ep_prev_end = e0
 
-            # exact T_report (sync): Δin(R_k+1) − in(R_k) − out(R_k)
+            # exact T_report (sync): Δin(R_k+1) − in(R_k) − out_vis(R_k), §4.2.1
             if rec.mode == "sync" and rec.r_next_in is not None and rec.r_k_in is not None:
-                exact = rec.r_next_in - rec.r_k_in - rec.r_k_out
+                r_k_out_vis = max((rec.r_k_out or 0) - (rec.r_k_reasoning or 0), 0)
+                exact = rec.r_next_in - rec.r_k_in - r_k_out_vis
                 # negative ⇒ compaction/turn-type change between samples: unreliable
                 rec.t_report_exact = exact if exact >= 0 else None
 
@@ -1297,7 +1350,13 @@ def build_economics(
                 rec.report_state = rec.protocol_state
             rec.report_chars = len(report)
             rec.t_report_est = int(rec.report_chars / chars_per_token)
-            rec.status = parse_status(report) if report else "unknown"
+            # §1.2: the host reports a terminal protocol but the payload is
+            # empty ⇒ semantic degraded state "empty"; an async still running
+            # simply has no report yet (stays unknown until delivery resolves).
+            if report:
+                rec.status = parse_status(report)
+            else:
+                rec.status = "empty" if rec.protocol_state != "running" else "unknown"
             rec.has_issues_section = "Issues & Observations" in report or "Issues and Observations" in report
 
             # actor execution inside the dispatch window
@@ -1359,14 +1418,61 @@ def build_economics(
                     if rec.warm and prev_ctx:
                         rec.t_dispatch_exact = max(u_first["input_tokens"] - prev_ctx, 0)
 
+                # §4.2.4 [M2]: outbound self-sufficiency — T_obs decomposition
+                # and the re-acquisition tax T_reload. A child `read` counts as
+                # reload when its [offset, offset+limit) interval is fully
+                # covered by earlier reads of the same path from (a) the parent
+                # before launch, (b) prior child dispatches (warm reuse or
+                # sibling children), or (c) earlier reads within this turn.
+                t_disp_used = (
+                    rec.t_dispatch_exact
+                    if rec.t_dispatch_exact is not None
+                    else rec.t_dispatch_est
+                )
+                prior_intervals: dict[str, list[tuple[float, float]]] = defaultdict(list)
+                parent_bill = bills.get(sid)
+                if parent_bill is not None:
+                    for rc in parent_bill.reads:
+                        if rc.ts < rec.start:
+                            prior_intervals[rc.path].append(read_interval(rc))
+                for cs in child_siblings:
+                    if cs in bills:
+                        for rc in bills[cs].reads:
+                            if rc.ts < rec.start:
+                                prior_intervals[rc.path].append(read_interval(rc))
+                observe_chars = 0
+                reload_chars = 0
+                in_turn_intervals: dict[str, list[tuple[float, float]]] = defaultdict(list)
+                for obs_span, obs_attrs in tool_win:
+                    obs_name = tool_name_of(obs_span, obs_attrs)
+                    if obs_name not in OBSERVE_TOOLS:
+                        continue
+                    observe_chars += len(tool_result_text(obs_attrs))
+                    if obs_name != "read":
+                        continue
+                    rc = read_call_of(obs_span, obs_attrs)
+                    lo, hi = read_interval(rc)
+                    covered_by = prior_intervals.get(rc.path, []) + in_turn_intervals.get(
+                        rc.path, []
+                    )
+                    if covered_by and any(a0 <= lo and hi <= b0 for a0, b0 in covered_by):
+                        reload_chars += rc.out_chars
+                    in_turn_intervals[rc.path].append((lo, hi))
+                rec.t_obs_tokens = round(observe_chars / chars_per_token)
+                rec.t_reload_tokens = round(reload_chars / chars_per_token)
+                if t_disp_used > 0:
+                    rec.rar = round(rec.t_reload_tokens / t_disp_used, 3)
+                    rec.dsr = round(1.0 / (1.0 + rec.rar), 3)
+
             # Bug B fix (2026-10-31): a sync dispatch that returned an empty
             # result AND shows zero child LLM activity in its window is a
             # failed resume/dispatch (e.g. warm session unresumable after
             # context saturation — ses_e799a9c6 k=5, 0s / empty result).
-            # Surface it as an error boundary instead of a silent UNKNOWN.
+            # §1.2 dual-layer: keep the host's protocol verdict untouched and
+            # surface semantic status "empty" (never a silent UNKNOWN) so the
+            # parent rotates the session instead of trusting the boundary.
             if rec.mode == "sync" and not report.strip() and rec.actor_llm_n == 0:
-                rec.protocol_state = "error"
-                rec.status = "Resume/Dispatch Failed (Empty)"
+                rec.status = "empty"
                 rec.verdict = "FAILED_DISPATCH"
 
             # Bug C fix (2026-10-31): plausibility gate on the exact Δin.
@@ -1400,6 +1506,21 @@ def build_economics(
                 # Blind Spot E: N_rem^ep is the authoritative multiplier — raw
                 # cross-episode N_rem once counted unrelated turns hours later.
                 rec.compounded_saved = rec.n_rem_ep * rec.dt_noise_tokens
+                # §4.2.3 [M4]: decode-priced net savings and the minimum
+                # amortization horizon N*_rem — dispatching pays off only once
+                # the episode's remaining turns cross it (β = c_out / c_in).
+                t_disp_used = (
+                    rec.t_dispatch_exact
+                    if rec.t_dispatch_exact is not None
+                    else rec.t_dispatch_est
+                )
+                boundary_cost = beta * (t_disp_used + report_tok)
+                rec.net_saved_tokens = round(rec.compounded_saved - boundary_cost)
+                rec.n_rem_star = (
+                    round(boundary_cost / rec.dt_noise_tokens, 2)
+                    if rec.dt_noise_tokens > 0
+                    else None
+                )
 
             score = rec.ncr_ctx if rec.ncr_ctx is not None else rec.ncr_char
             if rec.verdict == "FAILED_DISPATCH":
@@ -1416,12 +1537,13 @@ def build_economics(
                 rec.verdict = "MARGINAL_OVERHEAD"
 
             # Blind Spot E: post-failure parent inline escape (C_escape). After a
-            # boundary that ended error/cancelled/blocked (or failed to launch),
-            # attribute the parent's inline tool streak — up to the next subagent
-            # dispatch, the next compaction, or an idle gap > τ_ep — to boundary k.
+            # boundary in the rework set K_rework — protocol error/cancelled,
+            # semantic yielded/blocked/empty, or a failed launch — attribute the
+            # parent's inline tool streak — up to the next subagent dispatch,
+            # the next compaction, or an idle gap > τ_ep — to boundary k.
             if (
                 rec.protocol_state in ("error", "cancelled")
-                or rec.status in ("yielded", "blocked")
+                or rec.status in ("yielded", "blocked", "empty")
                 or rec.verdict == "FAILED_DISPATCH"
             ):
                 esc_candidates: list[datetime] = []
@@ -1646,7 +1768,7 @@ def build_economics(
             entry["children"].add(rec.child_session)
         entry["statuses"][rec.status] += 1
         entry["verdicts"][rec.verdict] += 1
-        if rec.status in ("yielded", "blocked") or rec.verdict in (
+        if rec.status in ("yielded", "blocked", "empty") or rec.verdict in (
             "HANDOFF_RETRY",
             "MARGINAL_OVERHEAD",
             "FAILED_DISPATCH",
@@ -1712,6 +1834,7 @@ def build_economics(
             "child_peak_warn": child_peak_warn,
             "episode_gap_min": episode_gap_min,
             "in_flight_window_sec": in_flight_window_sec,
+            "beta": beta,
         },
     }
 
@@ -1724,6 +1847,7 @@ def render_economics(econ: dict[str, Any], chars_per_token: float) -> str:
     task_events: dict[str, dict[str, Any]] = econ.get("task_events", {})
     params = econ.get("params") or {}
     child_peak_warn = params.get("child_peak_warn", DEFAULT_CHILD_PEAK_WARN)
+    beta = params.get("beta", DEFAULT_BETA)
     saturation: list[dict[str, Any]] = econ.get("child_saturation") or []
     overloaded_ids = {c["session_id"] for c in saturation if c.get("overloaded")}
     lines: list[str] = []
@@ -1856,6 +1980,38 @@ def render_economics(econ: dict[str, Any], chars_per_token: float) -> str:
     )
     lines.append("")
 
+    # §4.2.4 [M2]: outbound self-sufficiency per dispatch (T_reload / RAR / DSR)
+    if any(rec.t_obs_tokens or rec.t_reload_tokens for rec in dispatches):
+        lines.append("### Metric 2 — outbound self-sufficiency (T_reload / RAR / DSR)")
+        lines.append("")
+        lines.append("| k | parent | child | T_dispatch | T_obs | T_reload | RAR | DSR |")
+        lines.append("|---|---|---|---|---|---|---|---|")
+        for rec in dispatches:
+            t_disp_used = (
+                rec.t_dispatch_exact
+                if rec.t_dispatch_exact is not None
+                else rec.t_dispatch_est
+            )
+            if rec.child_session:
+                child = f"`{rec.child_session[:16]}…`"
+            else:
+                child = "-"
+            lines.append(
+                f"| {rec.k} | `{rec.parent_session[:16]}…` | {child} "
+                f"| {t_disp_used:,} | {rec.t_obs_tokens:,} | {rec.t_reload_tokens:,} "
+                f"| {rec.rar if rec.rar is not None else '-'} "
+                f"| {rec.dsr if rec.dsr is not None else '-'} |"
+            )
+        lines.append("")
+        lines.append(
+            "> T_reload = child `read` results fully covered by earlier reads of the same "
+            "path (parent before launch, prior child dispatches, or earlier in-turn — "
+            "§4.2.4 sources 1–3); RAR = T_reload/T_dispatch, DSR = 1/(1+RAR). "
+            "RAR = 0 ⇒ fully self-sufficient dispatch; RAR ≥ 1 (DSR ≤ 50%) ⇒ inverted "
+            "delegation: the child re-acquired known information at ≥ the prompt's cost."
+        )
+        lines.append("")
+
     # Boundary inspector
     if dispatches:
         lines.append("## Per-dispatch boundary inspector (Reasoner ↔ Actor)")
@@ -1863,9 +2019,10 @@ def render_economics(econ: dict[str, Any], chars_per_token: float) -> str:
         lines.append(
             "| k | window | mode | launch | child exec | warm | T_disp (exact/est) "
             "| actor llm/tool | raw chars | Δctx tok | delivery | T_report (exact/est) "
-            "| NCR_char | NCR_ctx | N_rem ep/raw | saved | protocol | status | verdict |"
+            "| NCR_char | NCR_ctx | N_rem ep/raw | saved | net saved | N*_rem "
+            "| protocol | status | verdict |"
         )
-        lines.append("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
+        lines.append("|" + "---|" * 21)
         for rec in dispatches:
             t_disp = (
                 f"{rec.t_dispatch_exact}/{rec.t_dispatch_est}"
@@ -1892,12 +2049,17 @@ def render_economics(econ: dict[str, Any], chars_per_token: float) -> str:
                 .replace("task_status_pull", "pull")
                 .replace("none", "⚠ none")
             )
+            net_saved = (
+                f"{rec.net_saved_tokens:,}" if rec.net_saved_tokens is not None else "-"
+            )
+            n_star = str(rec.n_rem_star) if rec.n_rem_star is not None else "-"
             lines.append(
                 f"| {rec.k} | {rec.start[11:19]}→{rec.end[11:19]} | {rec.mode} | {launch} "
                 f"| {child_exec} | {'warm' if rec.warm else 'COLD'} | {t_disp} "
                 f"| {rec.actor_llm_n}/{rec.actor_tool_n} | {rec.actor_raw_result_chars:,} "
                 f"| {absorbed} | {delivery} | {t_rep} | {ncr_char} | {ncr_ctx} "
                 f"| {rec.n_rem_ep}/{rec.n_rem} | {rec.compounded_saved:,} "
+                f"| {net_saved} | {n_star} "
                 f"| {rec.protocol_state or '-'} | {rec.status} | {rec.verdict} |"
             )
         lines.append("")
@@ -1976,6 +2138,11 @@ def render_economics(econ: dict[str, Any], chars_per_token: float) -> str:
                 f"NCR_ctx={rec.ncr_ctx:.2f}" if rec.ncr_ctx is not None else "NCR_ctx=-",
                 f"N_rem^ep={rec.n_rem_ep} (raw {rec.n_rem}, end={rec.episode_end_reason})",
                 f"saved≈{rec.compounded_saved:,} tok-calls",
+                f"net_saved={rec.net_saved_tokens:,} tok (β={beta:g})"
+                if rec.net_saved_tokens is not None
+                else "net_saved=-",
+                f"N*_rem={rec.n_rem_star}" if rec.n_rem_star is not None else "N*_rem=-",
+                f"RAR={rec.rar}/DSR={rec.dsr}" if rec.rar is not None else "RAR=-/DSR=-",
             ]
             lines.append("- economics: " + ", ".join(econ_bits))
             lines.append(f"- pre-reasoning: “{rec.pre_snippet}”")
@@ -2130,6 +2297,13 @@ def main(argv: list[str] | None = None) -> int:
         "for zh/en-mixed prompts on glm-5.3)",
     )
     parser.add_argument(
+        "--beta",
+        type=float,
+        default=DEFAULT_BETA,
+        help="output/input price ratio β = c_out/c_in for NetSaved_k and the "
+        f"amortization horizon N*_rem, k (§4.2.3; default {DEFAULT_BETA})",
+    )
+    parser.add_argument(
         "--boundary-snippet",
         type=int,
         default=200,
@@ -2187,6 +2361,7 @@ def main(argv: list[str] | None = None) -> int:
             child_peak_warn=args.child_peak_warn,
             episode_gap_min=args.episode_gap_min,
             in_flight_window_sec=args.in_flight_window_sec,
+            beta=args.beta,
         )
 
         if args.json_out:
