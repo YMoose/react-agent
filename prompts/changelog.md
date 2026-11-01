@@ -7,6 +7,60 @@ entries are sanitized of private paths, credentials, and raw user transcripts.
 
 ---
 
+## v3.4 — `orchestrator.md`: Strict Inline Prohibition & Single-Edit Exception
+
+- **Date**: 2026-11-01
+- **Files Changed**: `prompts/orchestrator.md` (`<Role>` rewritten; `<ReAct Loop>` Step 3 split into Warm Reuse / Cold Fallback branches)
+- **Trigger / Evidence**:
+  - In `ses_e828c9c15…` (`opencode-genai-obs`), Reasoner made `35` `subagent`
+    dispatches while running `v2.0`/`v3.1` prompts, then dropped to **`0`
+    `subagent` calls across `56` requests** after reloading `v3.3`
+    post-compaction — the inline escape drove Reasoner peak context to
+    `149,816` tokens and triggered a mid-task `compaction` (violating M4/M8).
+  - Turn 1 `opencode.reasoning` shows three distinct abuse vectors against the
+    v3.3 inline-edit exemption:
+    1. **Temporal inversion / self-bootstrapping**: the model used the focused
+       read allowance to *manufacture* the exemption precondition — *"The edit
+       targets are known once I read the exact region. I'll do it inline"* —
+       although the clause reserves the exception for content "already
+       formulated", not content formulated by reading first.
+    2. **Economic-formula self-exemption**: the model acknowledged the duty
+       (*"The Role says for multi-step implementation delegate to actor"*) and
+       overrode it with a cost judgment (*"doing it inline… is more reliable
+       than paying dispatch + re-prefill. The guidance says act inline when
+       ΔT_raw → 0"*). Cost-tradeoff formulas inside the runtime prompt invite
+       this: they hand the model a loophole instead of a rule.
+    3. **Shell allowance creep**: the *"single `git`/`diff` sync command"*
+       allowance stretched into inline `npm test`, `npm run build`, and
+       `git push` — justified by *"standard practice in this whole session
+       history"* (pre-v3.3 habit inertia).
+  - Contrast: `ses_e69ee727…` was born fresh **without** a `70KB`
+    `<conversation-checkpoint>` summary and, under the same `v3.3` prompt,
+    delegated correctly on the first turn (`NCR_ctx = 20.23`, DSR `1.0`,
+    `HIGH_GAIN`). The failure is therefore conditional on warm checkpoint
+    context self-granting ΔT_raw → 0 — hence the exception now requires
+    verbatim target lines **`(not checkpoint summaries)`** and caps inline
+    work at one single-block `edit` per turn.
+- **Target Economics / Boundary**:
+  - Enforces **Cut A** delegation compliance: removes the cost-tradeoff
+    formulas and the `read`/`shell` allowances that enabled $C_{\text{escape}}$
+    inline binges and parent window bloat $\mathrm{Peak}(R)$, while keeping
+    (a) the single-block in-view `edit` escape hatch and (b) the explicit
+    Step 3 Warm/Cold fallback structure so a failed or saturated warm
+    `sessionID` rotates to a fresh cold `actor` with `path:line` anchors
+    instead of escaping inline (ses_e799a9c6… k=5 `FAILED_DISPATCH`
+    regression guard).
+- **Expected Metric Impact**:
+  - **M2 (Trigger Rate)**: restore multi-step delegation trigger rate to
+    `100%` — including immediately after session compaction.
+  - **M4 & M8**: eliminate $C_{\text{escape}}$ inline binges; keep
+    $\mathrm{Peak}(R) < 40\text{k}$ tokens and parent `compaction` events at `0`.
+  - **M6 (Yielded precision)**: Step 1's explicit premise/write-boundary
+    declarations give `actor` lanes checkable premises, improving `Yielded
+    (Needs Reasoning)` signal fidelity over silent plan drift.
+
+---
+
 ## v3.3 — `orchestrator.md`: Inline Known-Content Edits & Avoid Heavy Warm-Lane Drag
 
 - **Date**: 2026-10-31
