@@ -23,6 +23,12 @@ scores every dispatch boundary.
 - `scripts/phoenix_subagent_usage.py` — stdlib-only telemetry and wire-body
   boundary analyzer (Phoenix GraphQL/SQLite + `~/.local/share/opencode/raw-requests/`
   fallback joined via `opencode.wire.seq`).
+- `skills/react-eval/` — **react-eval skill**: the 5-phase closed-loop
+  evaluation & tuning workflow (version forensics, grader-integrity gate,
+  Three-Cut/M1–M10 diagnosis, surgical prompt iteration, changelog/commit/
+  live-sync governance), with `references/tuning-casebook.md` (v2.0→v3.5
+  failure catalog + grader-bug archetypes) and `evals/evals.json`; symlinked
+  into `~/.agents/skills/react-eval` for OpenCode discovery.
 
 ## Prompt Change, Changelog & Git Commit Discipline (Mandatory)
 

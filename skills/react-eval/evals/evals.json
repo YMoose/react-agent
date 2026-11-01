@@ -1,0 +1,50 @@
+{
+  "skill_name": "react-eval",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "我跑了一下午，帮我看看当前 react-agent 的效果和有没有需要优化的地方",
+      "expected_output": "Runs the 5-phase closed loop end-to-end: (1) identifies which prompt version each afternoon session actually ran by checking system-prompt marker strings in ~/.local/share/opencode/raw-requests/ses_*.jsonl against prompts/ git history (noting sessions started before an edit keep the cached old prompt until restart/compaction); (2) runs scripts/phoenix_subagent_usage.py --project ocg-obs --chars-per-token 2.35 with --json-out to /tmp/opencode/; (3) passes suspicious figures (UNKNOWN verdicts, delivery=none, FAILED_DISPATCH, orphan_aborted_or_dropped, ⚠polluted) through the grader-integrity gate against the raw wire log before attributing them to the prompt; (4) reports M1-M10 results organized by Three-Cut boundary (Cut A trigger/sync-async/DSR, Cut B protocol×semantic status/adaptive compactness/Peak(A)<120k, Cut C NCR_ctx/NetSaved/warm-vs-rotation/C_escape/C_poll) with session prefixes and boundary k; (5) proposes at most one atomic, telemetry-backed prompt change (or explicitly none) rather than speculative edits.",
+      "files": [],
+      "expectations": [
+        "The analyzer command executed is scripts/phoenix_subagent_usage.py with --project ocg-obs and --chars-per-token 2.35 (offline --db fallback acceptable if Phoenix is unreachable)",
+        "Prompt-version forensics consults ~/.local/share/opencode/raw-requests/ses_*.jsonl and git history of prompts/ before scoring behavior",
+        "Any UNKNOWN / delivery=none / FAILED_DISPATCH / orphan_aborted_or_dropped / ⚠polluted figure is cross-checked against the parent wire JSONL before being blamed on the prompt",
+        "The report groups findings by Cut A / Cut B / Cut C and cites concrete M-numbered metrics with values and sanitized session prefixes",
+        "No prompt file is modified during this evaluation-only turn, or a single atomic change is proposed with its expected metric impact",
+        "Numbers in the summary match the analyzer output (verifiable by re-running the same command)"
+      ]
+    },
+    {
+      "id": 2,
+      "prompt": "为什么刚才那个 session 全是自己 inline 改代码，一次 actor 都没调？",
+      "expected_output": "Diagnoses the Cut A delegation-collapse regression: extracts the session's Reasoner reasoning from gen_ai.output.messages reasoning parts (opencode.reasoning fallback), establishes which prompt version was live (inline streaks often start right after a compaction reloaded a different prompt), and checks whether Reasoner quoted an exemption clause verbatim to self-exempt (e.g. a cost-formula justification like 'doing it inline is more reliable than paying dispatch + re-prefill', a read-allowance used to manufacture the exemption precondition, or shell allowance creep). Verifies the collapse in telemetry (0 subagent calls across N requests, C_escape context growth, Peak(R), compaction event), then designs the fix per prompt-principes.md §2.1 — replace economic trade-off formulas and read/shell loopholes with verifiable preconditions like 'verbatim target lines (not checkpoint summaries) are already present in your context' — and cites the v3.3 -> v3.4 casebook precedent.",
+      "files": [],
+      "expectations": [
+        "The parent session's reasoning text is actually inspected (gen_ai.output.messages reasoning parts or opencode.reasoning) and quoted as evidence",
+        "The prompt version actually live in that session is verified against the wire JSONL system prompt and prompts/ git history before the running prompt is blamed",
+        "The diagnosis identifies a self-exemption mechanism (exemption-clause quote, cost-formula override, read/shell allowance creep) rather than only counting the inline tool calls",
+        "Telemetry corroborates the collapse (subagent call count vs request count, C_escape / inline escape ctx delta, Peak(R), compaction timing)",
+        "The proposed fix follows prompt-principes.md §2.1 (verifiable preconditions, no cost trade-off formulas, no self-bootstrapping read/shell loopholes) and references the v3.3->v3.4 precedent from the tuning casebook",
+        "Measurement artifacts are ruled out first (the analyzer's subagent TOOL spans / dispatch table are not simply missing spans)"
+      ]
+    },
+    {
+      "id": 3,
+      "prompt": "帮我把这次发现的派单漏传上下文问题更新到 prompt 里并同步生效",
+      "expected_output": "Applies the prompt iteration with full repo governance: edits prompts/orchestrator.md (and/or prompts/fixer.md) with one atomic change addressing the under-specified outbound dispatch (anchor packing / explicit background flag per the diagnosis); prepends a privacy-sanitized entry to prompts/changelog.md containing Trigger / Evidence (sanitized session prefix, boundary k, RAR/DSR or other numbers), Target Economics / Boundary (inequality terms + Cut), and Expected Metric Impact (M-ids + direction) with no private paths, credentials, or raw user transcripts; stages only the prompt files in a dedicated concise `prompts: <summary>` commit whose brief body points to prompts/changelog.md (never mixed with script or report edits); then deploys with cp to ~/.config/opencode/oh-my-opencode-slim/react/ and verifies byte-identity with diff -u on both orchestrator.md and fixer.md, reporting that running sessions keep the cached old prompt until restart/compaction.",
+      "files": [
+        "prompts/orchestrator.md",
+        "prompts/changelog.md"
+      ],
+      "expectations": [
+        "The prompt edit is a single atomic change targeting the diagnosed root cause, and prompts stay lean (orchestrator.md + fixer.md under ~80 lines total)",
+        "A vN+1 changelog entry is prepended with all three required sections (Trigger / Evidence, Target Economics / Boundary, Expected Metric Impact)",
+        "The changelog entry contains no machine-specific absolute home paths, credentials, personal identifiers, or raw user prompts — only sanitized session prefixes and aggregate metrics",
+        "The git commit stages only prompts/*.md + prompts/changelog.md with a concise `prompts:` subject and 1-2 line body referencing prompts/changelog.md",
+        "cp deploys both prompts to ~/.config/opencode/oh-my-opencode-slim/react/ and diff -u against the repo copies returns empty (byte-identical) for orchestrator.md and fixer.md",
+        "The sync is repo -> live only, and the user is reminded that already-running sessions keep their cached prompt until restart or compaction"
+      ]
+    }
+  ]
+}
