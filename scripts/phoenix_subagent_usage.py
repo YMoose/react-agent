@@ -38,10 +38,12 @@ child execution window runs from launch to the report delivery point
 last span), and Δt_parallel = Σ child_exec − merged window union.
 
 All formulas are grounded in OTel GenAI semconv attributes
-(``gen_ai.usage.*``, ``gen_ai.tool.call.*``) plus the OpenInference/OpenCode
-bridge attributes (``input.value``, ``input.value_original_length``,
-``output.value``, ``opencode.reasoning``, ``opencode.wire.seq``,
-``opencode.session.parent_id``).  When a span body was truncated by the
+(``gen_ai.usage.*``, ``gen_ai.tool.call.*``, ``gen_ai.output.messages``
+reasoning parts) plus the OpenInference/OpenCode bridge attributes
+(``input.value``, ``input.value_original_length``, ``output.value``,
+``opencode.wire.seq``, ``opencode.session.parent_id``; legacy
+``opencode.reasoning`` is kept only as the flat-mirror fallback of the
+native reasoning parts).  When a span body was truncated by the
 plugin's 60 KiB attribute budget the script falls back to the untruncated
 per-session wire JSONL (``~/.local/share/opencode/raw-requests/``), matching
 frames via ``opencode.wire.seq``.
@@ -60,7 +62,7 @@ import urllib.error
 import urllib.request
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -105,6 +107,25 @@ TASK_CONTROL_TOOLS = {
 # Economic verdict thresholds on NCR_ctx (fallback: NCR_char when actor side unknown).
 VERDICT_HIGH_NCR = 8.0
 VERDICT_MODERATE_NCR = 2.0
+
+# Blind Spot D (2026-10-31): child-session saturation waterline τ_rotate. Warm
+# reuse is optimal only while the child's peak context stays below it; at or
+# above it a forced warm dispatch risks context overflow / crash (ses_e799a9c6
+# k=5 died at child Peak(A)=274,198 tok) and the child should be rotated —
+# carry a compact anchor summary into a fresh child session.
+DEFAULT_CHILD_PEAK_WARN = 120_000
+# Blind Spot E: an episode ends at the next `compaction` op in the parent or
+# an inter-turn idle gap longer than τ_ep minutes; N_rem^ep bounds the
+# compound-savings multiplier to the current episode (raw cross-episode N_rem
+# once counted 37 unrelated later turns for k=1).
+DEFAULT_EPISODE_GAP_MIN = 30
+# Blind Spot F: a child with recent activity whose parent wrote no newer spans
+# is "in flight" (parent blocked inside an open sync subagent call whose TOOL
+# span is not yet flushed to Phoenix); older uncovered children are orphans
+# (parent span dropped by crash/restart).
+DEFAULT_IN_FLIGHT_WINDOW_SEC = 600
+# Parent inline tools that constitute a post-failure escape streak (C_escape).
+INLINE_TOOLS = {"read", "edit", "write", "shell", "bash", "grep", "glob"}
 
 INF = float("inf")
 
@@ -491,6 +512,14 @@ def usage_of(attrs: dict[str, Any]) -> dict[str, int]:
     }
 
 
+def is_compaction_span(span: dict[str, Any], attrs: dict[str, Any]) -> bool:
+    """True for `compaction` operations (spec §1.1: gen_ai.operation.name)."""
+    op = dig(attrs, "gen_ai", "operation", "name")
+    if isinstance(op, str) and "compact" in op.lower():
+        return True
+    return "compact" in (span.get("name") or "").lower()
+
+
 def tool_result_text(attrs: dict[str, Any]) -> str:
     """Tool result: gen_ai.tool.call.result (semconv) with output.value fallback."""
     raw = dig(attrs, "gen_ai", "tool", "call", "result")
@@ -586,6 +615,40 @@ def task_status_state(result_text: str) -> str | None:
     """Protocol state line from a task_status render (``state: <word>``)."""
     m = re.search(r"^state:\s*(\w+)", result_text, re.MULTILINE)
     return m.group(1) if m else None
+
+
+def reasoning_text_of(attrs: dict[str, Any]) -> str:
+    """Chain-of-thought text for one LLM span.
+
+    Native source first: ``gen_ai.output.messages`` follows the GenAI semconv
+    ChatMessage schema, where thinking content is a standard part type —
+    ``[{"role":"assistant","parts":[{"type":"reasoning","content":…}, …]}]``
+    (reasoning parts precede text parts; the exporter never fabricates an
+    interleaving). Falls back to the legacy ``opencode.reasoning`` flat mirror
+    for older traces — and whenever the native JSON string was truncated past
+    parseability by the 60 KiB attribute budget.
+    """
+    raw = dig(attrs, "gen_ai", "output", "messages")
+    if isinstance(raw, str) and raw:
+        try:
+            messages = json.loads(raw)
+        except json.JSONDecodeError:
+            messages = None
+        if isinstance(messages, list):
+            chunks = [
+                part["content"]
+                for msg in messages
+                if isinstance(msg, dict)
+                for part in (msg.get("parts") or [])
+                if isinstance(part, dict)
+                and part.get("type") == "reasoning"
+                and isinstance(part.get("content"), str)
+            ]
+            if chunks:
+                return "\n\n".join(chunks)
+    legacy = attrs.get("opencode") or {}
+    value = legacy.get("reasoning") if isinstance(legacy, dict) else None
+    return value if isinstance(value, str) else ""
 
 
 def snippet(text: str, limit: int) -> str:
@@ -782,10 +845,18 @@ class DispatchBoundary:
     # economics
     ncr_char: float | None = None
     ncr_ctx: float | None = None
-    n_rem: int = 0
+    n_rem: int = 0  # raw: every parent LLM call after the report (cross-episode)
+    n_rem_ep: int = 0  # episode-bounded: stops at next compaction or idle gap > τ_ep
+    episode_end_reason: str | None = None  # compaction | idle_gap | session_end
     dt_noise_tokens: int = 0
-    compounded_saved: int = 0
+    compounded_saved: int = 0  # N_rem^ep × ΔT_noise (episode-bounded multiplier)
     verdict: str = "UNKNOWN"
+    # Blind Spot D: session-level peak context of the child (waterline τ_rotate)
+    child_peak_input: int | None = None
+    # Blind Spot E: post-failure parent inline escape streak (C_escape)
+    inline_escape_ctx_delta: int | None = None
+    inline_escape_tools: int = 0
+    inline_escape_duration_s: float | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -829,8 +900,16 @@ class DispatchBoundary:
             "ncr_char": round(self.ncr_char, 2) if self.ncr_char else None,
             "ncr_ctx": round(self.ncr_ctx, 2) if self.ncr_ctx else None,
             "n_rem": self.n_rem,
+            "n_rem_ep": self.n_rem_ep,
+            "episode_end_reason": self.episode_end_reason,
             "dt_noise_tokens": self.dt_noise_tokens,
             "compounded_saved": self.compounded_saved,
+            "child_peak_input": self.child_peak_input,
+            "inline_escape_ctx_delta": self.inline_escape_ctx_delta,
+            "inline_escape_tools": self.inline_escape_tools,
+            "inline_escape_duration_s": round(self.inline_escape_duration_s, 1)
+            if self.inline_escape_duration_s
+            else None,
             "pre_snippet": self.pre_snippet,
             "post_snippet": self.post_snippet,
             "verdict": self.verdict,
@@ -856,6 +935,9 @@ def build_economics(
     wire_dir: Path | None,
     chars_per_token: float,
     snippet_len: int,
+    child_peak_warn: int = DEFAULT_CHILD_PEAK_WARN,
+    episode_gap_min: int = DEFAULT_EPISODE_GAP_MIN,
+    in_flight_window_sec: int = DEFAULT_IN_FLIGHT_WINDOW_SEC,
 ) -> dict[str, Any]:
     """Compute the 4-metric scorecard and every dispatch boundary."""
     parsed = []
@@ -991,6 +1073,22 @@ def build_economics(
         parent_llm = sorted(
             [(s, a) for s, a in items if (s.get("spanKind") or "").lower() == "llm"],
             key=lambda p: p[0].get("startTime", ""),
+        )
+        # Blind Spot E timeline helpers: parent TOOL spans (inline-escape streaks)
+        # and `compaction` op timestamps (episode boundaries).
+        parent_tools = sorted(
+            [
+                (s, a)
+                for s, a in items
+                if (s.get("spanKind") or "").lower() == "tool"
+                or s.get("name", "").startswith("execute_tool")
+            ],
+            key=lambda p: p[0].get("startTime", ""),
+        )
+        compaction_ts = sorted(
+            tso(s.get("startTime", ""))
+            for s, a in items
+            if tso(s.get("startTime", "")) and is_compaction_span(s, a)
         )
         wire_frames = load_wire_frames(wire_dir, sid)
         # task_status(result=true) pulls indexed by target session for this parent
@@ -1140,7 +1238,7 @@ def build_economics(
                         rec.r_k_in, rec.r_k_out = u["input_tokens"], u["output_tokens"]
                         rec.r_k_reasoning = u["reasoning_output_tokens"]
                         rec.r_k_seq = str(dig(llm_attrs, "opencode", "wire", "seq") or "") or None
-                        rec.pre_snippet = snippet(dig(llm_attrs, "opencode", "reasoning") or "", snippet_len)
+                        rec.pre_snippet = snippet(reasoning_text_of(llm_attrs), snippet_len)
                         body, trunc, src = wire_body(llm_attrs, wire_frames)
                         rec.body_source_k, rec.body_truncated_k = src, trunc
                         break
@@ -1151,7 +1249,7 @@ def build_economics(
                     s0 = tso(llm_span.get("startTime", ""))
                     if s0 and t1 and s0 > t1:
                         rec.r_next_in = usage_of(llm_attrs)["input_tokens"]
-                        rec.post_snippet = snippet(dig(llm_attrs, "opencode", "reasoning") or "", snippet_len)
+                        rec.post_snippet = snippet(reasoning_text_of(llm_attrs), snippet_len)
                         break
             # N_rem: parent LLM calls after the report actually entered context
             rem_after = terminal_t if (rec.mode == "async" and terminal_t) else t1
@@ -1160,6 +1258,29 @@ def build_economics(
                 for llm_span, _ in parent_llm
                 if (s0 := tso(llm_span.get("startTime", ""))) and rem_after and s0 > rem_after
             )
+            # Blind Spot E: episode-bounded N_rem^ep — stop counting at the next
+            # `compaction` op or an inter-turn idle gap > τ_ep (default 30 min).
+            # Raw cross-episode N_rem stays on the record for comparison only.
+            ep_gap = timedelta(minutes=episode_gap_min)
+            horizon = next((c for c in compaction_ts if rem_after and c > rem_after), None)
+            rec.n_rem_ep, rec.episode_end_reason = 0, "session_end"
+            ep_prev_end: datetime | None = None
+            for llm_span, _ in parent_llm:
+                s0 = tso(llm_span.get("startTime", ""))
+                if not s0:
+                    continue
+                e0 = tso(llm_span.get("endTime", "")) or s0
+                if not rem_after or s0 <= rem_after:
+                    ep_prev_end = e0  # carry the pre-report end across the boundary
+                    continue
+                if horizon and s0 >= horizon:
+                    rec.episode_end_reason = "compaction"
+                    break
+                if ep_prev_end and (s0 - ep_prev_end) > ep_gap:
+                    rec.episode_end_reason = "idle_gap"
+                    break
+                rec.n_rem_ep += 1
+                ep_prev_end = e0
 
             # exact T_report (sync): Δin(R_k+1) − in(R_k) − out(R_k)
             if rec.mode == "sync" and rec.r_next_in is not None and rec.r_k_in is not None:
@@ -1276,7 +1397,9 @@ def build_economics(
             if report_tok:  # unknown T_report (undelivered async) ⇒ savings unknowable
                 raw_tok = int(rec.actor_raw_result_chars / chars_per_token)
                 rec.dt_noise_tokens = max(raw_tok - report_tok, 0)
-                rec.compounded_saved = rec.n_rem * rec.dt_noise_tokens
+                # Blind Spot E: N_rem^ep is the authoritative multiplier — raw
+                # cross-episode N_rem once counted unrelated turns hours later.
+                rec.compounded_saved = rec.n_rem_ep * rec.dt_noise_tokens
 
             score = rec.ncr_ctx if rec.ncr_ctx is not None else rec.ncr_char
             if rec.verdict == "FAILED_DISPATCH":
@@ -1291,9 +1414,180 @@ def build_economics(
                 rec.verdict = "MODERATE_GAIN"
             else:
                 rec.verdict = "MARGINAL_OVERHEAD"
+
+            # Blind Spot E: post-failure parent inline escape (C_escape). After a
+            # boundary that ended error/cancelled/blocked (or failed to launch),
+            # attribute the parent's inline tool streak — up to the next subagent
+            # dispatch, the next compaction, or an idle gap > τ_ep — to boundary k.
+            if (
+                rec.protocol_state in ("error", "cancelled")
+                or rec.status in ("yielded", "blocked")
+                or rec.verdict == "FAILED_DISPATCH"
+            ):
+                esc_candidates: list[datetime] = []
+                for later_span, _ in sub_spans[k:]:
+                    st = tso(later_span.get("startTime", ""))
+                    if st and t1 and st > t1:
+                        esc_candidates.append(st)
+                esc_candidates.extend(c for c in compaction_ts if t1 and c > t1)
+                esc_prev_end: datetime | None = None
+                for llm_span, _ in parent_llm:
+                    s0 = tso(llm_span.get("startTime", ""))
+                    e0 = tso(llm_span.get("endTime", "")) or s0
+                    if not s0:
+                        continue
+                    if t1 and s0 <= t1:
+                        esc_prev_end = e0
+                        continue
+                    if esc_prev_end and (s0 - esc_prev_end) > ep_gap:
+                        esc_candidates.append(s0)
+                        break
+                    esc_prev_end = e0
+                esc_end = min(esc_candidates) if esc_candidates else None
+                esc_tools = [
+                    (s, a)
+                    for s, a in parent_tools
+                    if (st := tso(s.get("startTime", ""))) and t1 and st > t1
+                    and (esc_end is None or st <= esc_end)
+                    and tool_name_of(s, a) in INLINE_TOOLS
+                ]
+                esc_llm = [
+                    (s, a)
+                    for s, a in parent_llm
+                    if (st := tso(s.get("startTime", ""))) and t1 and st > t1
+                    and (esc_end is None or st <= esc_end)
+                ]
+                if esc_tools and esc_llm:
+                    rec.inline_escape_tools = len(esc_tools)
+                    u_first = usage_of(esc_llm[0][1])
+                    u_last = usage_of(esc_llm[-1][1])
+                    rec.inline_escape_ctx_delta = max(
+                        u_last["input_tokens"] - u_first["input_tokens"], 0
+                    )
+                    last_act = max(
+                        (
+                            tso(s.get("endTime", "")) or tso(s.get("startTime", ""))
+                            for s, _ in esc_tools + esc_llm
+                        ),
+                        default=None,
+                    )
+                    if last_act and t1:
+                        rec.inline_escape_duration_s = (last_act - t1).total_seconds()
             dispatches.append(rec)
 
     dispatches.sort(key=lambda d: (d.parent_session, d.start))
+
+    # ---- Blind Spot D: child saturation waterline (Peak(A) < τ_rotate) -----
+    # Peak(A) = the child session's peak input context (same meter as M4's
+    # `peak input`). Warm reuse is optimal only below τ_rotate; at/above it a
+    # forced warm dispatch risks overflow/crash and the child should rotate
+    # (ses_e799a9c6 k=5 died at child Peak(A)=274,198 tok).
+    for rec in dispatches:
+        if rec.child_session and rec.child_session in bills:
+            rec.child_peak_input = bills[rec.child_session].peak_input
+    dispatched_children = {d.child_session for d in dispatches if d.child_session}
+    child_sessions = sorted(
+        set(child_parent)
+        | dispatched_children
+        | {sid for sid, roles in sessions_roles.items() if roles & CHILD_AGENT_ROLES}
+    )
+    child_saturation: list[dict[str, Any]] = []
+    for sid in child_sessions:
+        bill = bills.get(sid)
+        if not bill or not bill.llm_n:
+            continue
+        overloaded = bill.peak_input >= child_peak_warn
+        child_saturation.append(
+            {
+                "session_id": sid,
+                "parent_id": child_parent.get(sid),
+                "peak_input": bill.peak_input,
+                "llm_n": bill.llm_n,
+                "overloaded": overloaded,
+                "verdict": "CHILD_OVERLOADED (Rotate Session)" if overloaded else "ok",
+            }
+        )
+    child_saturation.sort(key=lambda c: (-c["peak_input"], c["session_id"]))
+
+    # ---- Blind Spot F: orphan / in-flight children --------------------------
+    # A child session is *covered* when any parent `subagent` TOOL span exists
+    # for it: a dispatch record names it, a subagent span's params name it, or
+    # its first span falls inside a parent subagent window (an end-less span is
+    # still open in memory — sync return pending). Uncovered children split by
+    # recency vs the trace horizon: recent + parent silent ⇒ in-flight; stale ⇒
+    # orphan (parent span dropped by crash/restart — ses_e7063a72 →
+    # ses_e706375e7 after a restart lost the covering span).
+    subagent_windows: list[tuple[str, str | None, datetime, datetime | None]] = []
+    for span, attrs, sid in parsed:
+        kind = (span.get("spanKind") or "").lower()
+        if kind != "tool" and not span.get("name", "").startswith("execute_tool"):
+            continue
+        if tool_name_of(span, attrs) != "subagent":
+            continue
+        params = dig(attrs, "tool", "parameters") or {}
+        named = params.get("sessionID") or params.get("task_id") or params.get("taskID")
+        st = tso(span.get("startTime", ""))
+        if st is None:
+            continue
+        et = tso(span.get("endTime", ""))  # None = span still open (sync call)
+        subagent_windows.append((sid, str(named) if named else None, st, et))
+    span_ends = [
+        tso(s.get("endTime", "")) or tso(s.get("startTime", "")) for s, _, _ in parsed
+    ]
+    trace_max_end = max((e for e in span_ends if e), default=None)
+
+    orphan_children: list[dict[str, Any]] = []
+    for sid in child_sessions:
+        pid = child_parent.get(sid)
+        items = by_session.get(sid) or []
+        if not items:
+            continue
+        first_start = tso(items[0][0].get("startTime", ""))
+        child_ends = [
+            tso(s.get("endTime", "")) or tso(s.get("startTime", "")) for s, _ in items
+        ]
+        last_end = max((e for e in child_ends if e), default=None)
+        if not first_start or not last_end:
+            continue
+        # covered paths (a)–(c)
+        if sid in dispatched_children:
+            continue
+        if any(named == sid for _, named, _, _ in subagent_windows if named):
+            continue
+        covered = False
+        for wparent, _, w0, w1 in subagent_windows:
+            if pid is None or wparent != pid:
+                continue
+            if w0 <= first_start and (w1 is None or first_start <= w1):
+                covered = True
+                break
+        if covered:
+            continue
+        # uncovered → classify by recency + parent silence after child start
+        age_s = (trace_max_end - last_end).total_seconds() if trace_max_end else INF
+        parent_items = by_session.get(pid) or []
+        parent_newer = any(
+            (st := tso(s.get("startTime", ""))) and st > first_start for s, _ in parent_items
+        )
+        in_flight = age_s <= in_flight_window_sec and not parent_newer
+        cls = "in_flight_pending_parent" if in_flight else "orphan_aborted_or_dropped"
+        bill = bills.get(sid)
+        consumed = (bill.tot_input + bill.tot_output) if bill else 0
+        orphan_children.append(
+            {
+                "session_id": sid,
+                "parent_id": pid,
+                "classification": cls,
+                "age_s": round(age_s, 1) if age_s != INF else None,
+                "first_span": items[0][0].get("startTime", ""),
+                "last_span_end": max(
+                    (s.get("endTime", "") for s, _ in items), default=""
+                ),
+                "llm_n": bill.llm_n if bill else 0,
+                "consumed_tokens": consumed,
+            }
+        )
+    orphan_children.sort(key=lambda o: (o["classification"], o["session_id"]))
 
     # ---- pair-level rollups --------------------------------------------------
     pairs: dict[str, dict[str, Any]] = {}
@@ -1320,6 +1614,14 @@ def build_economics(
                 "rework": 0,
                 "async": 0,
                 "child_windows": [],
+                # Blind Spot E: post-failure parent inline escape (C_escape) rollup
+                "escape_ctx_delta": 0,
+                "escape_tools": 0,
+                "escape_duration_s": 0.0,
+                "escape_dispatches": 0,
+                # Blind Spot F: uncovered children attributed to this parent
+                "orphan_children": 0,
+                "orphan_waste_tokens": 0,
             },
         )
         entry["dispatches"] += 1
@@ -1355,6 +1657,19 @@ def build_economics(
             c0, c1 = tso(rec.child_start), tso(rec.child_end)
             if c0 and c1:
                 entry["child_windows"].append((c0, c1))
+        if rec.inline_escape_ctx_delta is not None:
+            entry["escape_ctx_delta"] += rec.inline_escape_ctx_delta
+            entry["escape_tools"] += rec.inline_escape_tools
+            entry["escape_dispatches"] += 1
+        if rec.inline_escape_duration_s is not None:
+            entry["escape_duration_s"] += rec.inline_escape_duration_s
+    for orphan in orphan_children:
+        if orphan["classification"] != "orphan_aborted_or_dropped":
+            continue  # in-flight children are pending, not yet waste
+        pentry = pairs.get(orphan["parent_id"] or "")
+        if pentry is not None:
+            pentry["orphan_children"] += 1
+            pentry["orphan_waste_tokens"] += orphan["consumed_tokens"]
 
     # Δt_parallel per parent: serial sum vs merged union of child execution windows
     for entry in pairs.values():
@@ -1391,6 +1706,13 @@ def build_economics(
         "dispatches": dispatches,
         "pairs": pairs,
         "task_events": task_events,
+        "child_saturation": child_saturation,
+        "orphan_children": orphan_children,
+        "params": {
+            "child_peak_warn": child_peak_warn,
+            "episode_gap_min": episode_gap_min,
+            "in_flight_window_sec": in_flight_window_sec,
+        },
     }
 
 
@@ -1400,6 +1722,10 @@ def render_economics(econ: dict[str, Any], chars_per_token: float) -> str:
     dispatches: list[DispatchBoundary] = econ["dispatches"]
     pairs: dict[str, dict[str, Any]] = econ["pairs"]
     task_events: dict[str, dict[str, Any]] = econ.get("task_events", {})
+    params = econ.get("params") or {}
+    child_peak_warn = params.get("child_peak_warn", DEFAULT_CHILD_PEAK_WARN)
+    saturation: list[dict[str, Any]] = econ.get("child_saturation") or []
+    overloaded_ids = {c["session_id"] for c in saturation if c.get("overloaded")}
     lines: list[str] = []
     lines.append("## Context-bandwidth economics scorecard")
     lines.append("")
@@ -1423,11 +1749,36 @@ def render_economics(econ: dict[str, Any], chars_per_token: float) -> str:
             continue
         lines.append(
             f"| `{bill.session_id[:20]}…` | {','.join(sorted(bill.roles)) or '-'} "
-            f"| {bill.llm_n} | {bill.peak_input:,} | {bill.tot_input:,} "
+            f"| {bill.llm_n} | {bill.peak_input:,}{' ⚠rotate' if bill.session_id in overloaded_ids else ''} "
+            f"| {bill.tot_input:,} "
             f"| {bill.tot_cache_read:,} | {bill.cache_hit_pct:.0f}% "
             f"| {bill.tot_output:,} | {bill.tot_reasoning:,} | {bill.visible_output:,} |"
         )
     lines.append("")
+
+    # Blind Spot D: child saturation waterline (Peak(A) < τ_rotate)
+    if saturation:
+        lines.append(
+            f"### Child saturation waterline — Peak(A) vs τ_rotate = {child_peak_warn:,} tok"
+        )
+        lines.append("")
+        lines.append("| child session | parent | llm | Peak(A) | verdict |")
+        lines.append("|---|---|---|---|---|")
+        for c in saturation:
+            mark = " ⚠" if c["overloaded"] else ""
+            parent = f"`{c['parent_id'][:18]}…`" if c.get("parent_id") else "-"
+            lines.append(
+                f"| `{c['session_id'][:20]}…` | {parent} | {c['llm_n']} "
+                f"| {c['peak_input']:,}{mark} | {c['verdict']} |"
+            )
+        lines.append("")
+        lines.append(
+            "> Peak(A) = child session's peak input context (dual of M4's parent Peak(R)). "
+            "Warm reuse (γ_warm→1) is optimal only below τ_rotate; at/above it rotate the "
+            "child — carry a compact anchor summary into a fresh session — or the next "
+            "warm dispatch risks overflow/crash (regression: k=5 at Peak(A)=274,198 tok)."
+        )
+        lines.append("")
 
     # Metric 1/2/3 pair summary
     if pairs:
@@ -1512,7 +1863,7 @@ def render_economics(econ: dict[str, Any], chars_per_token: float) -> str:
         lines.append(
             "| k | window | mode | launch | child exec | warm | T_disp (exact/est) "
             "| actor llm/tool | raw chars | Δctx tok | delivery | T_report (exact/est) "
-            "| NCR_char | NCR_ctx | N_rem | saved | protocol | status | verdict |"
+            "| NCR_char | NCR_ctx | N_rem ep/raw | saved | protocol | status | verdict |"
         )
         lines.append("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
         for rec in dispatches:
@@ -1546,7 +1897,7 @@ def render_economics(econ: dict[str, Any], chars_per_token: float) -> str:
                 f"| {child_exec} | {'warm' if rec.warm else 'COLD'} | {t_disp} "
                 f"| {rec.actor_llm_n}/{rec.actor_tool_n} | {rec.actor_raw_result_chars:,} "
                 f"| {absorbed} | {delivery} | {t_rep} | {ncr_char} | {ncr_ctx} "
-                f"| {rec.n_rem} | {rec.compounded_saved:,} "
+                f"| {rec.n_rem_ep}/{rec.n_rem} | {rec.compounded_saved:,} "
                 f"| {rec.protocol_state or '-'} | {rec.status} | {rec.verdict} |"
             )
         lines.append("")
@@ -1595,6 +1946,13 @@ def render_economics(econ: dict[str, Any], chars_per_token: float) -> str:
                 f"raw results {rec.actor_raw_result_chars:,} chars, "
                 f"Δctx {rec.actor_absorbed_tokens if rec.actor_absorbed_tokens is not None else '-'} tok"
             )
+            if rec.child_peak_input is not None:
+                over = rec.child_peak_input >= child_peak_warn
+                lines.append(
+                    f"- child Peak(A): {rec.child_peak_input:,} tok "
+                    f"(τ_rotate={child_peak_warn:,})"
+                    + (" **⚠CHILD_OVERLOADED (Rotate Session)**" if over else "")
+                )
             lines.append(
                 f"- report: {rec.report_chars:,} chars, "
                 f"protocol `{rec.protocol_state or '?'}` / semantic **{rec.status}**"
@@ -1606,10 +1964,17 @@ def render_economics(econ: dict[str, Any], chars_per_token: float) -> str:
                     else ""
                 )
             )
+            if rec.inline_escape_ctx_delta is not None:
+                lines.append(
+                    f"- ↪ **inline escape (C_escape)** attributed to this boundary: parent "
+                    f"absorbed the work inline for {rec.inline_escape_duration_s / 60:.0f} min — "
+                    f"{rec.inline_escape_tools} tool call(s), "
+                    f"+{rec.inline_escape_ctx_delta:,} tok parent context growth"
+                )
             econ_bits = [
                 f"NCR_char={rec.ncr_char:.2f}" if rec.ncr_char is not None else "NCR_char=-",
                 f"NCR_ctx={rec.ncr_ctx:.2f}" if rec.ncr_ctx is not None else "NCR_ctx=-",
-                f"N_rem={rec.n_rem}",
+                f"N_rem^ep={rec.n_rem_ep} (raw {rec.n_rem}, end={rec.episode_end_reason})",
                 f"saved≈{rec.compounded_saved:,} tok-calls",
             ]
             lines.append("- economics: " + ", ".join(econ_bits))
@@ -1680,12 +2045,54 @@ def render_economics(econ: dict[str, Any], chars_per_token: float) -> str:
                 )
         lines.append("")
 
+    # Blind Spot F: orphan / in-flight children
+    orphans: list[dict[str, Any]] = econ.get("orphan_children") or []
+    if orphans:
+        lines.append("### Orphan / in-flight children (uncovered by parent `subagent` spans)")
+        lines.append("")
+        lines.append("| child session | parent | classification | age | llm | consumed tok |")
+        lines.append("|---|---|---|---|---|---|")
+        for o in orphans:
+            age = f"{o['age_s'] / 60:.0f} min" if o.get("age_s") is not None else "n/a"
+            parent = f"`{o['parent_id'][:18]}…`" if o.get("parent_id") else "-"
+            lines.append(
+                f"| `{o['session_id'][:20]}…` | {parent} | **{o['classification']}** "
+                f"| {age} | {o['llm_n']} | {o['consumed_tokens']:,} |"
+            )
+        lines.append("")
+        lines.append(
+            "> `in_flight_pending_parent` = child active recently and parent wrote no newer "
+            "spans (parent blocked inside a sync `subagent` call whose TOOL span is still "
+            "open in memory — window `--in-flight-window-sec`). `orphan_aborted_or_dropped` = "
+            "child ended/stale with the covering parent span lost (crash/restart); its "
+            "consumed tokens count as dropped waste in C_rework (M3)."
+        )
+        lines.append("")
+
     total_saved = sum(rec.compounded_saved for rec in dispatches)
+    total_escape_tok = sum(r.inline_escape_ctx_delta or 0 for r in dispatches)
+    total_escape_tools = sum(r.inline_escape_tools or 0 for r in dispatches)
+    total_escape_s = sum(r.inline_escape_duration_s or 0.0 for r in dispatches)
+    orphan_waste = sum(
+        o["consumed_tokens"] for o in orphans if o["classification"] == "orphan_aborted_or_dropped"
+    )
     if dispatches:
         lines.append(
-            f"- **compounded prefill noise saved** Σ N_rem·ΔT_noise = **{total_saved:,} token-calls** "
-            "(estimate; most would have been cache reads — the harder saving is context-window headroom)"
+            f"- **compounded prefill noise saved** Σ N_rem^ep·ΔT_noise = **{total_saved:,} token-calls** "
+            "(episode-bounded multiplier; estimate — most would have been cache reads — "
+            "the harder saving is context-window headroom)"
         )
+        if total_escape_tok:
+            lines.append(
+                f"- **post-failure inline escape (Σ C_escape)** ≈ **+{total_escape_tok:,} tok** parent "
+                f"context across {total_escape_tools} inline tool call(s), {total_escape_s / 60:.0f} min — "
+                "work the parent absorbed itself after failed/blocked dispatches"
+            )
+        if orphan_waste:
+            lines.append(
+                f"- **orphan dropped waste (C_rework)** ≈ **{orphan_waste:,} tok** consumed by child "
+                "sessions whose covering parent `subagent` span was lost — re-executed work"
+            )
         lines.append("")
     return "\n".join(lines)
 
@@ -1729,6 +2136,28 @@ def main(argv: list[str] | None = None) -> int:
         help="max chars of pre/post reasoning snippets in the boundary inspector",
     )
     parser.add_argument(
+        "--child-peak-warn",
+        type=int,
+        default=DEFAULT_CHILD_PEAK_WARN,
+        help=f"child saturation waterline τ_rotate in tokens: flag child sessions with "
+        f"Peak(A) at/above it as CHILD_OVERLOADED (default {DEFAULT_CHILD_PEAK_WARN:,})",
+    )
+    parser.add_argument(
+        "--episode-gap-min",
+        type=int,
+        default=DEFAULT_EPISODE_GAP_MIN,
+        help=f"episode boundary τ_ep in minutes: N_rem^ep stops at the next compaction or "
+        f"an inter-turn idle gap longer than this (default {DEFAULT_EPISODE_GAP_MIN})",
+    )
+    parser.add_argument(
+        "--in-flight-window-sec",
+        type=int,
+        default=DEFAULT_IN_FLIGHT_WINDOW_SEC,
+        help=f"recency window in seconds classifying an uncovered child as "
+        f"in_flight_pending_parent vs orphan_aborted_or_dropped "
+        f"(default {DEFAULT_IN_FLIGHT_WINDOW_SEC})",
+    )
+    parser.add_argument(
         "--wire-dir",
         type=Path,
         default=DEFAULT_WIRE_DIR,
@@ -1750,7 +2179,15 @@ def main(argv: list[str] | None = None) -> int:
         sessions = analyze(spans)
 
         wire_dir = args.wire_dir if (args.wire_dir and args.wire_dir.is_dir()) else None
-        econ = build_economics(spans, wire_dir, args.chars_per_token, args.boundary_snippet)
+        econ = build_economics(
+            spans,
+            wire_dir,
+            args.chars_per_token,
+            args.boundary_snippet,
+            child_peak_warn=args.child_peak_warn,
+            episode_gap_min=args.episode_gap_min,
+            in_flight_window_sec=args.in_flight_window_sec,
+        )
 
         if args.json_out:
             args.json_out.parent.mkdir(parents=True, exist_ok=True)
@@ -1767,6 +2204,9 @@ def main(argv: list[str] | None = None) -> int:
                                 for pid, entry in econ["pairs"].items()
                             },
                             "task_events": econ.get("task_events", {}),
+                            "child_saturation": econ.get("child_saturation", []),
+                            "orphan_children": econ.get("orphan_children", []),
+                            "params": econ.get("params", {}),
                         },
                     },
                     indent=2,
