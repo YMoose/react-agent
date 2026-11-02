@@ -128,7 +128,38 @@ often than the prompt.
    in the parent wire log; the classifier booked `2,187,913` tok as
    `C_rework`. Fix: wire cross-check classifies such children
    `delivered_missing_tool_span`, excluded from waste (true orphan level:
-   `57,217` tok).
+   `57,217` tok — later reclassified as infra-kill by Bug H below).
+
+7. **First-surviving-span R_k+1 binding across a host restart (Bug G,
+   2026-11-03)** — sync `t_report_exact = Δin(R_k+1) − in(R_k) − out_vis(R_k)`
+   bound R_k+1 to the first parent LLM span surviving after the dispatch end
+   with no check that that span is the turn which consumed the wrapper. When
+   a host restart drops the true consume span (`ses_e68dff2d…` k=1: wrapper
+   frame `12:41:39`, next surviving span `23:44:17` — 11 h later), Δin
+   silently absorbs restart-recovery prompts, `<system-update>` catalogs and
+   abort notices (exact `3,672` tok for a `1,506`-char report; also
+   `ses_e799a9c6…` k=12, where an intermediate pre-wrapper turn was bound
+   instead). The Bug-C pollution gate usually catches the large case, but
+   small cross-boundary deltas pass it while still measuring the wrong
+   turn. Fix (wrapper-frame binding guard): locate the earliest post-
+   dispatch wire frame with a NEW wrapper occurrence for the child (record
+   `ts` order, JSON-escaped quotes); its consuming span is the last parent
+   LLM span starting at/before it (+1 s slack). Mismatch ⇒ exact nulled,
+   `restart_interleaved` friction flag, estimate stays effective, and
+   `post_snippet` is no longer harvested from the post-restart span.
+
+8. **Infra-killed child charged as C_rework (Bug H, 2026-11-03)** — a child
+   aborted by a host/server restart leaves no completed wrapper and no
+   covering TOOL span (Code-Mode `execute` launches never have one), so it
+   fell to `orphan_aborted_or_dropped` once the recency windows expired —
+   even though the parent's own wire log records the explicit kill notice
+   `{"error":{"type":"aborted","message":"Tool execution interrupted
+   (sessionID: …)"}`. Two such children (`57,579` + `57,217` tok, the
+   latter previously cited as the "true orphan level" in Bug 2) were booked
+   as agent-attributable rework waste. Fix: the orphan branch scans the
+   parent wire for `Tool execution interrupted (sessionID: <sid>` and
+   classifies such children `killed_by_host_restart` — consumed tokens are
+   reported as infrastructure overhead, excluded from C_rework.
 
 Related measurement refinement (same date): `Δpeak_self = Peak(R) − in(R_1)`
 now separates sessions born with a huge first prompt (e.g. peak `204,458`

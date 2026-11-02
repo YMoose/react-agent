@@ -967,6 +967,12 @@ class DispatchBoundary:
     r_consume_start: str = ""
     pre_snippet: str = ""
     post_snippet: str = ""
+    snippet_source: str = ""  # consume span | post-restart span (consume span dropped)
+    # Fix A (2026-11-03): True when the first surviving post-dispatch parent
+    # LLM span does NOT carry the wrapper-bearing wire frame (a host restart
+    # dropped the true consume span) ⇒ exact T_report measured across the
+    # restart gap is untrustworthy; the char-based estimate stays effective.
+    restart_interleaved: bool = False
     body_source_k: str = ""
     body_truncated_k: bool = False
     # actor execution inside the dispatch window
@@ -1051,6 +1057,8 @@ class DispatchBoundary:
             "t_report_est": self.t_report_est,
             "t_report_polluted": self.t_report_polluted,
             "t_report_effective": self.t_report_effective,
+            "restart_interleaved": self.restart_interleaved,
+            "snippet_source": self.snippet_source,
             "ncr_char": round(self.ncr_char, 2) if self.ncr_char else None,
             "ncr_ctx": round(self.ncr_ctx, 2) if self.ncr_ctx else None,
             "n_rem": self.n_rem,
@@ -1503,12 +1511,77 @@ def build_economics(
 
             # R_k+1: first parent LLM span starting after the dispatch end
             if rec.r_next_in is None:
+                bound_span = bound_attrs = None
                 for llm_span, llm_attrs in parent_llm:
                     s0 = tso(llm_span.get("startTime", ""))
                     if s0 and t1 and s0 > t1:
+                        bound_span, bound_attrs = llm_span, llm_attrs
                         rec.r_next_in = usage_of(llm_attrs)["input_tokens"]
-                        rec.post_snippet = snippet(reasoning_text_of(llm_attrs), snippet_len)
                         break
+                if bound_span is not None:
+                    # Fix A (2026-11-03): wrapper-frame binding guard. The
+                    # first parent LLM span surviving after the dispatch end
+                    # is the true consume turn ONLY if the parent wire frame
+                    # that actually carries the child wrapper maps onto it.
+                    # When a host restart drops the consume span (ses_e68dff2d…
+                    # k=1: wrapper frame 12:41:39, next surviving span
+                    # 23:44:17), binding silently measures Δin across the
+                    # restart gap and absorbs recovery prompts,
+                    # <system-update> catalogs and abort notices into "exact"
+                    # T_report. Locate the earliest post-dispatch wire frame
+                    # with a NEW wrapper occurrence for this child (record ts
+                    # order — never seq; quotes are JSON-escaped inside
+                    # bodies); its consuming span is the last parent LLM span
+                    # starting at/before it (+1s slack, as in link_consume).
+                    # Mismatch ⇒ exact untrustworthy: null it, flag
+                    # restart_interleaved (the estimate stays effective), and
+                    # do not harvest post_snippet from the post-restart span.
+                    consume_wr = None
+                    if rec.child_session:
+                        esc_open = '<subagent sessionID=\\"' + rec.child_session + '\\"'
+                        plain_open = '<subagent sessionID="' + rec.child_session + '"'
+
+                        def _wr_count(wr: dict[str, Any]) -> int:
+                            return wr["frame"].count(esc_open) + wr["frame"].count(plain_open)
+
+                        baseline = 0
+                        for wr in wire_records:
+                            rdt = wr["ts_dt"]
+                            if rdt and t1 and rdt <= t1:
+                                baseline = _wr_count(wr)
+                        for wr in wire_records:
+                            rdt = wr["ts_dt"]
+                            if not rdt or not t1 or rdt <= t1:
+                                continue
+                            if _wr_count(wr) > baseline:
+                                consume_wr = wr
+                                break
+                    covering = None
+                    if consume_wr is not None:
+                        rdt = consume_wr["ts_dt"]
+                        for llm_span, llm_attrs in parent_llm:
+                            s0 = tso(llm_span.get("startTime", ""))
+                            if s0 and rdt and s0 <= rdt + timedelta(seconds=1):
+                                covering = llm_span
+                    # Async dispatches resolve their consume turn separately
+                    # (native-notification scan / task_status pull +
+                    # link_consume) and never rely on this binding, so the
+                    # guard applies to sync dispatches only.
+                    if (
+                        rec.mode == "sync"
+                        and consume_wr is not None
+                        and covering is not bound_span
+                    ):
+                        rec.r_next_in = None
+                        rec.r_consume_in = None
+                        rec.r_consume_start = ""
+                        rec.restart_interleaved = True
+                        rec.snippet_source = "post-restart span (consume span dropped)"
+                    else:
+                        rec.post_snippet = snippet(
+                            reasoning_text_of(bound_attrs), snippet_len
+                        )
+                        rec.snippet_source = "consume span"
             # N_rem: parent LLM calls after the report actually entered context
             rem_after = terminal_t if (rec.mode == "async" and terminal_t) else t1
             rec.n_rem = sum(
@@ -1922,6 +1995,40 @@ def build_economics(
                 }
             )
             continue
+        # Fix B (2026-11-03): host-restart kill notice. A parent wire record
+        # containing `Tool execution interrupted (sessionID: <sid>` proves the
+        # child was aborted by a server/host restart AND that the parent
+        # received an explicit kill notice — infra overhead, not agent-
+        # attributable dropped work. Book as killed_by_host_restart; the
+        # C_rework aggregation only counts orphan_aborted_or_dropped, so
+        # these tokens are reported separately instead of as rework waste.
+        if pid:
+            kill_needle = "Tool execution interrupted (sessionID: %s" % sid
+            kill_ts = ""
+            for wr in wire_records_of(pid):
+                if kill_needle in wr["frame"]:
+                    kill_ts = wr["ts"]
+                    break
+            if kill_ts:
+                bill = bills.get(sid)
+                orphan_children.append(
+                    {
+                        "session_id": sid,
+                        "parent_id": pid,
+                        "classification": "killed_by_host_restart",
+                        "age_s": None,
+                        "first_span": items[0][0].get("startTime", ""),
+                        "last_span_end": max(
+                            (s.get("endTime", "") for s, _ in items), default=""
+                        ),
+                        "llm_n": bill.llm_n if bill else 0,
+                        "consumed_tokens": (bill.tot_input + bill.tot_output)
+                        if bill
+                        else 0,
+                        "notice_ts": kill_ts,
+                    }
+                )
+                continue
         # uncovered → classify by recency + parent silence after child start
         # Liveness / in-flight guard: an uncovered child whose latest activity
         # lies within CHILD_LIVE_WINDOW_SEC of the trace horizon is still
@@ -2291,6 +2398,8 @@ def render_economics(econ: dict[str, Any], chars_per_token: float) -> str:
             )
             if rec.t_report_polluted:
                 t_rep += "⚠"  # exact Δin polluted by host injections → est effective
+            if rec.restart_interleaved:
+                t_rep += "⟳"  # consume span dropped across host restart → est effective
             ncr_char = f"{rec.ncr_char:.2f}" if rec.ncr_char is not None else "-"
             ncr_ctx = f"{rec.ncr_ctx:.2f}" if rec.ncr_ctx is not None else "-"
             absorbed = (
@@ -2378,7 +2487,12 @@ def render_economics(econ: dict[str, Any], chars_per_token: float) -> str:
                     f", exact injected {rec.t_report_exact:,} tok"
                     + (" ⚠polluted → est effective" if rec.t_report_polluted else "")
                     if rec.t_report_exact is not None
-                    else ""
+                    else (
+                        ", exact injected unavailable — restart_interleaved "
+                        "(consume span dropped across host restart) → est effective"
+                        if rec.restart_interleaved
+                        else ""
+                    )
                 )
             )
             if rec.inline_escape_ctx_delta is not None:
@@ -2401,7 +2515,14 @@ def render_economics(econ: dict[str, Any], chars_per_token: float) -> str:
             ]
             lines.append("- economics: " + ", ".join(econ_bits))
             lines.append(f"- pre-reasoning: “{rec.pre_snippet}”")
-            lines.append(f"- post-reasoning: “{rec.post_snippet}”")
+            if rec.restart_interleaved and not rec.post_snippet:
+                lines.append(
+                    "- post-reasoning: — (not harvested: the consume span was dropped "
+                    "across a host restart; the first surviving post-dispatch span is "
+                    "post-restart)"
+                )
+            else:
+                lines.append(f"- post-reasoning: “{rec.post_snippet}”")
             lines.append("")
 
     # Δt_parallel: async child windows vs serial sum
@@ -2494,7 +2615,10 @@ def render_economics(econ: dict[str, Any], chars_per_token: float) -> str:
             "`delivered_missing_tool_span` = child completed and its "
             "`<subagent sessionID=… state=\"completed\">` wrapper was found in the parent's wire "
             "log — only the Phoenix `execute_tool subagent` TOOL span was dropped; real delivered "
-            "work, excluded from orphan waste."
+            "work, excluded from orphan waste. `killed_by_host_restart` = the parent's wire log "
+            "records an explicit `Tool execution interrupted (sessionID: …)` kill notice — the "
+            "child was aborted by a host/server restart; its consumed tokens are infrastructure "
+            "overhead, never agent-attributable C_rework."
         )
         lines.append("")
 
@@ -2521,6 +2645,15 @@ def render_economics(econ: dict[str, Any], chars_per_token: float) -> str:
             lines.append(
                 f"- **orphan dropped waste (C_rework)** ≈ **{orphan_waste:,} tok** consumed by child "
                 "sessions whose covering parent `subagent` span was lost — re-executed work"
+            )
+        killed = [o for o in orphans if o["classification"] == "killed_by_host_restart"]
+        if killed:
+            killed_tok = sum(o["consumed_tokens"] for o in killed)
+            lines.append(
+                f"- **killed by host restart (infra overhead)** ≈ {killed_tok:,} tok across "
+                f"{len(killed)} child session(s) whose parent wire records an explicit "
+                "`Tool execution interrupted (sessionID: …)` notice — aborted by "
+                "infrastructure, excluded from C_rework"
             )
         wire_recovered = [o for o in orphans if o["classification"] == "delivered_missing_tool_span"]
         if wire_recovered:
