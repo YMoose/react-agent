@@ -7,6 +7,34 @@ entries are sanitized of private paths, credentials, and raw user transcripts.
 
 ---
 
+## v3.6 — `orchestrator.md`: Outbound Goal/Why Curation (No Actor Scaffolding)
+
+- **Date**: 2026-11-03
+- **Files Changed**: `prompts/orchestrator.md` (`<ReAct Loop>` Step 1 outbound
+  packing clause; `prompts/fixer.md` intentionally unchanged)
+- **Trigger / Evidence**:
+  - Design hypothesis grounded in `context-engineering/prompt-principes.md`
+    (§1 "Less Scaffolding, More Curation" & §2.1 "Provide Why / Motivation"):
+    `v3.5` packed positional facts (`premises, write boundaries, path:line
+    anchors`) to prevent reload waste (`RAR → 0`), but omitted the *why* (the
+    goal or hypothesis the step serves in Reasoner's plan). Capable models
+    generalize on unlisted edge cases when given the underlying motivation in
+    context, without needing extra instruction scaffolding in `fixer.md`.
+- **Target Economics / Boundary**:
+  - Targets **Cut A** ($T_{\text{dispatch}}$ curation, adding ~15–30 tokens of
+    intent) to lower **Cut B/C** information-loss probability $p_{\text{loss}}$
+    in $C_{\text{risk}}$ (§4.2.6) while keeping $T_{\text{reload}} \to 0$ in
+    $C_{\text{state}}$ (§4.2.4).
+- **Expected Metric Impact**:
+  - **M3 / M6 ($C_{\text{risk}}$, $p_{\text{loss}}$)**: fewer blind-execution
+    reworks and higher-signal `Yielded (Needs Reasoning)` escalations when
+    code reality conflicts with the step's goal.
+  - **M1 / M2 ($\mathrm{NCR}$, $\mathrm{DSR}$)**: maintain `DSR > 0.80` while
+    helping Actor filter exploration and report conclusions around the
+    decision Reasoner needs to make.
+
+---
+
 ## v3.5 — `orchestrator.md`: Sync/Async Background Flag & Outbound Anchor Packing
 
 - **Date**: 2026-11-01
