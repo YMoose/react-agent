@@ -4,7 +4,7 @@
 > 分析脚本：`obsystem/react-agent/scripts/phoenix_subagent_usage.py`
 > 数据源：`obsystem/phoenix-runtime/data/phoenix.db` + `~/.local/share/opencode/raw-requests/ses_*.jsonl`
 
-> 2026-11-03 事实核查说明：以下数值保留原评估记录，本次未重跑历史快照。`精确` 列名改为 usage 差分候选值；`Saved` 是字符估算与剩余轮次相乘的代理量。不同会话的任务、输入和完成质量未受控，差值只能作描述性对照，不能归因为协作模式的因果收益。当前公式、分类及局限见 [react-mode-eval.md](react-mode-eval.md) 与 [source-audit.md](source-audit.md)。
+> 2026-11-03 事实核查说明：以下数值保留原评估记录，本次未重跑历史快照。`精确` 列名改为 usage 差分候选值；`Saved` 是字符估算与剩余轮次相乘的代理量。不同会话的任务、输入和完成质量未受控，差值只能作描述性对照，不能归因为协作模式的因果收益。当前公式、分类及已知局限见 [react-mode-eval.md](react-mode-eval.md) 与 [tuning-casebook.md](../skills/react-eval/references/tuning-casebook.md)。
 
 ---
 

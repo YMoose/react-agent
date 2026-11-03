@@ -29,7 +29,6 @@ a prompt without the Phase 5 governance trail.
   - `../../reports/react-mode-eval.md` — local model: 3-layer Context Economics
     Inequality, Three-Cut boundary model, M1–M10 metric registry
   - `../../reports/react-mode-eval.md` §6 — measurement and comparison guardrails
-  - `../../reports/source-audit.md` — verified source facts and remaining limitations
 - Empirical failure & grader-bug catalog: `./references/tuning-casebook.md`
 
 ## Phase 1 — Prompt-Version Forensics & Telemetry Run (摸清运行版本与拉取遥测)
