@@ -2,59 +2,25 @@
 
 ## Project Structure & Module Organization
 
-This repository is the evaluation harness for the Reasoner↔Actor (react-mode)
-collaboration research. It pairs the live prompts with the OCP theoretical
-specification, the empirical benchmarks, and the telemetry analyzer that
-scores every dispatch boundary.
+This repository is the evaluation and tuning harness for `Reasoner ↔ Actor` (`react`-mode) collaboration, closing the loop between live prompts, the context-economics specification, empirical benchmarks, and the telemetry analyzer:
 
-- `prompts/orchestrator.md` & `prompts/fixer.md` — **source-of-truth Reasoner
-  and Actor prompts**. These are the version-controlled baselines synced to
-  `~/.config/opencode/oh-my-opencode-slim/react/`; the deployed copies there
-  are runtime state, this repo is the history.
-- `prompts/changelog.md` — **detailed rationale log for all prompt changes**,
-  recording empirical triggers, Context Economics Inequality mappings, and
-  expected metric shifts for every prompt iteration.
-- `reports/react-mode-eval.md` — OCP theoretical specification: OTel GenAI
-  SemConv telemetry contract + the 4-family/9-primitive model, the 3-layer
-  Context Economics Inequality, the Three-Cut Boundary Model (Cut A/B/C), and
-  the M1–M10 Metric Registry.
-- `reports/react-mode-eval-benchmarks.md` — empirical benchmark results and
-  per-session scorecards produced by the commands below.
-- `scripts/phoenix_subagent_usage.py` — stdlib-only telemetry and wire-body
-  boundary analyzer (Phoenix GraphQL/SQLite + `~/.local/share/opencode/raw-requests/`
-  fallback joined via `opencode.wire.seq`).
-- `skills/react-eval/` — **react-eval skill**: the 5-phase closed-loop
-  evaluation & tuning workflow (version forensics, grader-integrity gate,
-  Three-Cut/M1–M10 diagnosis, surgical prompt iteration, changelog/commit/
-  live-sync governance), with `references/tuning-casebook.md` (v2.0→v3.5
-  failure catalog + grader-bug archetypes) and `evals/evals.json`; symlinked
-  into `~/.agents/skills/react-eval` for OpenCode discovery.
+- `prompts/orchestrator.md` & `prompts/fixer.md` — **Source-of-truth Reasoner and Actor prompts**, synced one-way from this repository to runtime state at `~/.config/opencode/oh-my-opencode-slim/react/`.
+- `prompts/changelog.md` — **Falsifiable rationale log** mapping every prompt change to empirical telemetry triggers, Context Economics Inequality terms, and expected `M1–M10` shifts.
+- `reports/react-mode-eval.md` — **Core evaluation specification (§1–§6)**: 4-family/9-primitive interaction model & Three-Cut Boundary (`§1`), Context Bandwidth Economics Inequality (`§2`), OTel GenAI SemConv telemetry contract (`§3`), observable parameter expansion with per-term `M1–M10` formulas and verdicts (`§4.1–§4.3`), and adapter extension slots (`§5`).
+- `reports/react-mode-eval-benchmarks.md` — **Empirical benchmark scorecards** and regression analyses across real `ocg-obs` sessions.
+- `scripts/phoenix_subagent_usage.py` — **Stdlib-only boundary analyzer** joining Phoenix GraphQL/SQLite spans with `~/.local/share/opencode/raw-requests/` wire JSONL via `opencode.wire.seq`.
+- `skills/react-eval/` — **Closed-loop evaluation skill** (5-phase workflow, `references/tuning-casebook.md`, and `evals/evals.json`), symlinked at `~/.agents/skills/react-eval`.
 
-## Prompt Change, Changelog & Git Commit Discipline (Mandatory)
+## Prompt Iteration, Privacy & Deployment Workflow
 
-1. **Detailed rationale in `prompts/changelog.md`**: Every change to
-   `prompts/orchestrator.md` or `prompts/fixer.md` MUST be accompanied by a
-   detailed entry in `prompts/changelog.md` covering:
-   1. **Trigger / Evidence**: The observed failure mode, dispatch boundary
-      (`k`), and quantitative telemetry findings (or `design hypothesis` if
-      pre-empirical).
-   2. **Target Economics / Boundary**: Which term of the Context Economics
-      Inequality (`G_ctx`, `G_time` vs `C_tx`, `C_state`, `C_gov`, `C_risk`)
-      and which boundary cut (`Cut A` / `Cut B` / `Cut C`) the change targets,
-      including the underlying physical mechanism.
-   3. **Expected Metric Impact**: Which metrics (`M1`–`M10`) are expected to
-      move and in what direction.
-2. **Privacy & Data Sanitization (去除隐私数据)**: Always strip sensitive or
-   private data before writing to `prompts/changelog.md`, `AGENTS.md`,
-   `reports/*.md`, or Git commit messages. Never record API keys, credentials,
-   personal names/emails, machine-specific absolute home paths (use repo-relative
-   paths or `~/...`), or raw private user prompts; keep only sanitized session
-   prefixes (e.g., `ses_e799a9c6…`), boundary indices (`k=5`), and aggregate
-   token/timing metrics.
-3. **Concise Git commit messages**: Stage the updated `prompts/*.md` together
-   with `prompts/changelog.md` in a dedicated commit (never mix with unrelated
-   script or report edits). Because the full rationale lives in
-   `prompts/changelog.md`, keep the Git commit message brief:
+To keep prompt changes falsifiable and prevent drift between version-controlled prompts and live OpenCode runtime state:
+
+1. **Record the rationale (`prompts/changelog.md`)**: Pair every edit to `prompts/orchestrator.md` or `prompts/fixer.md` with a changelog entry stating:
+   - **Trigger / Evidence**: observed failure mode, boundary index (`k`), and quantitative telemetry (or `design hypothesis` when pre-empirical).
+   - **Target Economics / Boundary**: the targeted inequality term (`G_ctx`, `G_time` vs `C_tx`, `C_state`, `C_gov`, `C_risk`), boundary cut (`Cut A` / `Cut B` / `Cut C`), and physical mechanism.
+   - **Expected Metric Impact**: which `M1–M10` metrics should move and in what direction.
+2. **Keep public-repo telemetry sanitized**: Because this repository is published to a public remote (`github.com:YMoose/react-agent`), write all docs, changelogs, and commits using repo-relative or `~/...` paths, short session prefixes (`ses_e799a9c6…`), boundary indices (`k=5`), aggregate token/timing metrics, and the `YMoose <YMoose@users.noreply.github.com>` commit identity—omitting API keys, personal emails/names, machine-specific `/home/<user>` paths, and raw private user prompts.
+3. **Isolate prompt commits**: Stage `prompts/*.md` with `prompts/changelog.md` in a dedicated commit (separate from script or report changes) with a concise summary referencing the changelog (`2d7bbd3` marks the v2.0 baseline):
 
    ```text
    prompts: <concise imperative summary>
@@ -62,9 +28,7 @@ scores every dispatch boundary.
    <1–2 line summary of the change and target metric; see prompts/changelog.md>.
    ```
 
-   Reference: `2d7bbd3` records the unmodified v2 baseline.
-4. **Live sync & verification**: After committing, deploy the prompts and
-   verify byte-identity before running any evaluation session:
+4. **Deploy repo → live runtime and verify byte-identity** before running evaluation sessions:
 
    ```bash
    cp prompts/orchestrator.md prompts/fixer.md ~/.config/opencode/oh-my-opencode-slim/react/ \
@@ -72,66 +36,37 @@ scores every dispatch boundary.
      && diff -u prompts/fixer.md ~/.config/opencode/oh-my-opencode-slim/react/fixer.md
    ```
 
-   (Empty `diff` output = deployed. Only sync in this repo→live direction;
-   never overwrite the repo copy from the live directory without a documented
-   `prompts/changelog.md` entry.)
+   Empty `diff` output confirms deployment. Always promote changes from `prompts/` to the live directory so git history remains authoritative.
 
-## Verification & Analysis Commands
+## Verification & Ground-Truth Gates
 
-Run focused checks for whatever changed:
+Run focused checks for every change and verify against objective pass criteria:
 
 ```bash
-# script syntax gate (after any edit to scripts/phoenix_subagent_usage.py)
+# 1. Syntax gate after editing scripts/phoenix_subagent_usage.py
 python3 -m py_compile scripts/phoenix_subagent_usage.py
 
-# standard evaluation run (Phoenix GraphQL at localhost:6006; add
-# --json-out /tmp/opencode/ocg-obs.json for machine-readable scorecards)
-python3 scripts/phoenix_subagent_usage.py --project ocg-obs --chars-per-token 2.35
+# 2. Live evaluation run against Phoenix GraphQL (localhost:6006)
+python3 scripts/phoenix_subagent_usage.py --project ocg-obs --chars-per-token 2.35 \
+  --json-out /tmp/opencode/ocg-obs.json
 
-# offline variant when the Phoenix server is down (snapshot db + wal + shm first)
+# 3. Offline evaluation run when Phoenix server is down (snapshot db + wal + shm first)
 python3 scripts/phoenix_subagent_usage.py --db /tmp/opencode/phx/phoenix.db \
   --project ocg-obs --chars-per-token 2.35
 ```
 
-Expect boundaries to resolve as `sync`/`async` from anchored result wrappers,
-failed empty dispatches as `FAILED_DISPATCH`, and inflated `T_report` exacts
-to carry the `⚠polluted` marker.
+**Pass criteria**: boundaries resolve as `sync`/`async` from anchored result wrappers, empty non-running dispatches classify as `status="empty"` with `FAILED_DISPATCH`, and inflated exact `T_report` values carry the `⚠polluted` marker.
 
-## Upstream Telemetry Gaps: Report, Don't Patch (上游采集缺陷：上报，不取巧修补)
+## Upstream Telemetry Fidelity (Ground-Truth Preservation)
 
-When the analyzer or an eval session finds missing, truncated, or ambiguous
-telemetry produced upstream — the `ocg-obs` exporter
-(`~/yzh/obsystem/opencode-genai-obs`), its wire JSONL, or host-emitted
-events/attributes — the default response is to **report the information gap
-upstream, not to paper over it with clever downstream patching**.
+Tuning prompts or grading formulas on corrupted observations invalidates the feedback loop. When an evaluation surfaces missing, truncated, or ambiguous telemetry from the upstream exporter (`~/yzh/obsystem/opencode-genai-obs`), wire JSONL, or host runtime:
 
-1. **Classify the gap first**: grader-logic bug (fix here in a `scripts:`
-   commit with a casebook entry) vs. upstream data deficiency (dropped span,
-   truncated attribute, ambiguous semantics). The Phase 2 grader-integrity
-   gate is where this classification happens; never hillclimb prompts or
-   grader heuristics on data whose root cause lives upstream.
-2. **If upstream deficiency: write it up as an upstream requirement report**
-   with root-cause `path:line` evidence, sanitized session prefixes, a
-   concrete change spec, and an acceptance plan — then hand it to the
-   `ocg-obs` owner. Reference example: `~/yzh/obsystem/react-eval-and-tool-span-loss-report.md`
-   (2026-11-03: late tool terminals, `flushAll` fake-`OK`, user-cancel vs
-   host-kill ambiguity). Do not encode upstream data-shape assumptions into
-   our analyzer to make the symptom disappear.
-3. **Downstream workarounds are allowed only as labeled stopgaps**: the wire
-   JSONL fallback exists because upstream spans can be dropped or truncated;
-   it must stay visibly a fallback (documented in the casebook), never
-   silently promoted to "fixed" — otherwise the root cause never gets fixed
-   upstream and our assumptions break silently when its behavior changes.
-4. **Never invent semantics the host did not emit** (e.g. synthesizing
-   terminal statuses or reason codes). Classification rules for genuinely
-   ambiguous cases (e.g. `killed_by_host_restart`) must be structurally
-   gated, documented in the casebook, and reported upstream as an
-   information-gap request.
+1. **Separate analyzer bugs from upstream gaps** during the Phase 2 grader-integrity check: fix analyzer logic defects in `scripts/phoenix_subagent_usage.py` (with a `tuning-casebook.md` entry), and treat dropped spans, truncated attributes, or missing host reason codes as upstream data requirements.
+2. **Escalate upstream gaps with a concrete spec**: File an upstream requirement report containing `path:line` root-cause evidence, sanitized `ses_…` prefixes, proposed attribute/event schema changes, and acceptance criteria (reference: `~/yzh/obsystem/react-eval-and-tool-span-loss-report.md`).
+3. **Keep downstream fallbacks explicitly labeled**: Maintain stopgaps (such as wire JSONL recovery or structurally gated `killed_by_host_restart` classification) as documented fallbacks in `tuning-casebook.md` rather than synthesizing unverified host semantics.
 
 ## Conventions
 
-- Keep Markdown imperative and concise; lowercase kebab-case filenames.
-- Commit subjects follow `<scope>: <imperative summary>` (e.g.
-  `scripts: …`, `prompts: …`, `docs: …`); one logical change per commit.
-- Reports may be edited by parallel sessions: stage explicitly by path and
-  never `git add -A` in this repository.
+- Write concise, imperative Markdown with lowercase `kebab-case` filenames.
+- Format commit subjects as `<scope>: <imperative summary>` (`scripts: …`, `prompts: …`, `docs: …`), one logical change per commit.
+- Stage files explicitly by path (`git add <path>`) so concurrent evaluation sessions editing `reports/` do not collide.
