@@ -8,7 +8,7 @@ This repository is the evaluation and tuning harness for `Reasoner ↔ Actor` (`
 - `prompts/changelog.md` — **Falsifiable rationale log** mapping every prompt change to empirical telemetry triggers, Context Economics Inequality terms, and expected `M1–M10` shifts.
 - `reports/react-mode-eval.md` — **Core evaluation specification (§1–§6)**: 4-family/9-primitive interaction model & Three-Cut Boundary (`§1`), Context Bandwidth Economics Inequality (`§2`), OTel GenAI SemConv telemetry contract (`§3`), observable parameter expansion with per-term `M1–M10` formulas and verdicts (`§4.1–§4.3`), and adapter extension slots (`§5`).
 - `reports/react-mode-eval-benchmarks.md` — **Empirical benchmark scorecards** and regression analyses across real `ocg-obs` sessions.
-- `scripts/phoenix_subagent_usage.py` — **Stdlib-only boundary analyzer** joining Phoenix GraphQL/SQLite spans with `~/.local/share/opencode/raw-requests/` wire JSONL via `opencode.wire.seq`.
+- `scripts/phoenix_subagent_usage.py` — **Stdlib-only boundary analyzer** joining Phoenix GraphQL/SQLite spans with `~/.local/share/opencode/raw-requests/` wire JSONL using seq-based body recovery and timestamp/wrapper-based delivery matching (see `reports/source-audit.md` for limits).
 - `skills/react-eval/` — **Closed-loop evaluation skill** (5-phase workflow, `references/tuning-casebook.md`, and `evals/evals.json`), symlinked at `~/.agents/skills/react-eval`.
 
 ## Prompt Iteration, Privacy & Deployment Workflow
@@ -50,7 +50,7 @@ python3 -m py_compile scripts/phoenix_subagent_usage.py
 python3 scripts/phoenix_subagent_usage.py --project ocg-obs --chars-per-token 2.35 \
   --json-out /tmp/opencode/ocg-obs.json
 
-# 3. Offline evaluation run when Phoenix server is down (snapshot db + wal + shm first)
+# 3. Offline evaluation run when Phoenix server is down (use a consistent SQLite backup, or stop writes before copying db + wal + shm)
 python3 scripts/phoenix_subagent_usage.py --db /tmp/opencode/phx/phoenix.db \
   --project ocg-obs --chars-per-token 2.35
 ```
@@ -62,7 +62,7 @@ python3 scripts/phoenix_subagent_usage.py --db /tmp/opencode/phx/phoenix.db \
 Tuning prompts or grading formulas on corrupted observations invalidates the feedback loop. When an evaluation surfaces missing, truncated, or ambiguous telemetry from the upstream exporter (`~/yzh/obsystem/opencode-genai-obs`), wire JSONL, or host runtime:
 
 1. **Separate analyzer bugs from upstream gaps** during the Phase 2 grader-integrity check: fix analyzer logic defects in `scripts/phoenix_subagent_usage.py` (with a `tuning-casebook.md` entry), and treat dropped spans, truncated attributes, or missing host reason codes as upstream data requirements.
-2. **Escalate upstream gaps with a concrete spec**: File an upstream requirement report containing `path:line` root-cause evidence, sanitized `ses_…` prefixes, proposed attribute/event schema changes, and acceptance criteria (reference: `~/yzh/obsystem/react-eval-and-tool-span-loss-report.md`).
+2. **Escalate upstream gaps with a concrete spec**: File an upstream requirement report containing `path:line` root-cause evidence, sanitized `ses_…` prefixes, proposed attribute/event schema changes, and acceptance criteria (record known limitations in `reports/source-audit.md`; attach a separate upstream report when available).
 3. **Keep downstream fallbacks explicitly labeled**: Maintain stopgaps (such as wire JSONL recovery or structurally gated `killed_by_host_restart` classification) as documented fallbacks in `tuning-casebook.md` rather than synthesizing unverified host semantics.
 
 ## Conventions

@@ -6,6 +6,12 @@ signatures quickly and to avoid re-introducing fixed anti-patterns.
 All session identifiers are sanitized prefixes; no private paths or
 transcripts.
 
+Source-audit note (2026-11-03): historical numbers below are retained, not
+recomputed in this documentation pass. Cross-session input differences are
+descriptive, not controlled causal savings; usage differences and read-overlap
+metrics are proxies. The 120k warning is policy, and an empty resume does not
+prove context overflow. See `../../../reports/source-audit.md`.
+
 ## Part A — Prompt Iteration Casebook
 
 ### v2.0 (Baseline, commit `2d7bbd3`)
@@ -17,7 +23,7 @@ transcripts.
   γ_warm `80%`, `NCR_char = 9.48:1`, `NCR_ctx = 12.62:1`, Reasoner peak
   `30,166` tok vs `195,749` inline baseline (`-58.5%` total input).
 
-### v3.1 — Warm-Saturation Crash -> Rotation Rule (Cut C)
+### v3.1 — High-Input Empty Resume -> Rotation Rule (Cut C)
 
 - Failure (`ses_e799a9c6…` `k=5`): warm child (`ses_e70bb348…`) reached
   `129` LLM turns / `274,198` input tokens; resume returned `0 chars` in
@@ -47,7 +53,7 @@ transcripts.
 - The prompt added an inline exemption justified by cost economics
   ("act inline when `ΔT_raw -> 0`") plus a `<150`-line focused-read and a
   single `git`/`diff` shell allowance.
-- Failure (`ses_e828c9c15…`, post-compaction reload of v3.3):
+- Failure (`ses_e828c9c15…`, v3.3 observed after compaction; reload causality unconfirmed):
   `0` subagent calls across `56` requests after `35` earlier dispatches —
   Reasoner self-exempted via three vectors: (1) temporal inversion (used the
   read allowance to *manufacture* the exemption precondition), (2)
@@ -55,7 +61,7 @@ transcripts.
   paying dispatch + re-prefill"), (3) shell allowance creep (`npm test`,
   `npm run build`, `git push`). Peak hit `149,816` tok + mid-task
   compaction.
-- Lesson (`prompt-principes.md` §2.1): runtime prompts must state checkable
+- Local design lesson: runtime prompts must state checkable
   preconditions, never trade-off formulas the model can argue with.
 
 ### v3.4 — Strict Inline Prohibition + Single-Edit Exception
@@ -111,11 +117,12 @@ often than the prompt.
    `in_flight_pending_parent` classes excluded from waste.
 5. **JSON-escaped wire notifications + occurrence-count deltas (Bug 1,
    2026-11-01, commit `1eca441`)** — async completions misreported as
-   `delivery: none / running / UNKNOWN` because (a) Phoenix truncates
-   `input.value` at `60` KiB, (b) wrapper quotes are JSON-escaped inside
+   `delivery: none / running / UNKNOWN` because (a) the exporter truncates
+   `input.value` at its configured budget (default `60` KiB), (b) wrapper quotes are JSON-escaped inside
    serialized request bodies so plain-quote regexes never match, (c) the
-   wire JSONL `seq` counter resets across host restarts and is a different
-   namespace than spans' `opencode.wire.seq`, and (d) wrappers persist in
+   wire JSONL `seq` counter resets across recorder restarts; the current
+   exporter uses that same counter for spans' `opencode.wire.seq`, but
+   neither is unique across restarts, and (d) wrappers persist in
    every later frame, so a warm re-dispatch needs its OWN occurrence.
    Fix: scan the full parent wire record list in `ts` order; delivery =
    first post-launch frame whose occurrence count for the child exceeds the
@@ -159,7 +166,8 @@ often than the prompt.
    as agent-attributable rework waste. Fix: the orphan branch scans the
    parent wire for `Tool execution interrupted (sessionID: <sid>` and
    classifies such children `killed_by_host_restart` — consumed tokens are
-   reported as infrastructure overhead, excluded from C_rework.
+   excluded from C_rework by that heuristic. This label alone does not prove
+   infrastructure causality.
    *Revision (2026-11-03, Bug I–L commit)*: the needle match is now
    STRUCTURE-gated — the notice must sit in a
    `messages[*].content[*].type == "tool_result"` part with `is_error` true;
