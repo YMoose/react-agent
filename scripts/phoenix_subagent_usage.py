@@ -738,7 +738,7 @@ def frame_wrapper_scan(wire_records: list[dict[str, Any]]) -> list[list[dict[str
 
 
 def frame_kill_notice(frame: str, needle: str) -> bool:
-    """True when the kill notice sits in a STRUCTURED tool_result slot.
+    """True when the kill notice sits in a tool-result slot the host emitted.
 
     Fix B hardening (Bug H revision, 2026-11-03): a bare substring scan of the
     whole frame also matched plain-text discussions (an eval session quoted
@@ -746,6 +746,20 @@ def frame_kill_notice(frame: str, needle: str) -> bool:
     reasoning) and the byte-identical tool_result a user interrupt produces.
     Only ``messages[*].content[*].type == "tool_result"`` parts with
     ``is_error == true`` and the needle inside count as kill notices.
+
+    Bug H follow-up (2026-11-03): OpenAI-style frames carry tool results as
+    content-part lists, but Anthropic-style frames carry them as
+    ``{"role": "tool", "content": "<json-string>"}`` — the structured-only
+    gate missed those, so host-killed children stayed
+    ``orphan_aborted_or_dropped`` (ses_e7063a7… → ses_e706375e…, whose wire
+    content is the JSON envelope
+    ``{"error":{"type":"aborted","message":"Tool execution interrupted
+    (sessionID: …)"},"content":[]}``). A string content counts ONLY when it
+    parses to a JSON object carrying a non-empty ``error`` object with the
+    needle inside it — the string twin of ``is_error == true`` + needle.
+    Still no bare substring scan: a tool result that merely quotes the
+    notice text (log dumps, reports) has no error envelope and must not
+    match. The cancelled-wrapper exclusion stays as-is (user interrupts).
     """
     try:
         payload = json.loads(frame)
@@ -757,18 +771,32 @@ def frame_kill_notice(frame: str, needle: str) -> bool:
         if not isinstance(msg, dict):
             continue
         content = msg.get("content")
-        if not isinstance(content, list):
-            continue
-        for part in content:
-            if not isinstance(part, dict) or part.get("type") != "tool_result":
+        if isinstance(content, list):
+            for part in content:
+                if not isinstance(part, dict) or part.get("type") != "tool_result":
+                    continue
+                if part.get("is_error") is not True:
+                    continue
+                try:
+                    body = json.dumps(part, ensure_ascii=False)
+                except (TypeError, ValueError):
+                    continue
+                if needle in body:
+                    return True
+        elif msg.get("role") == "tool" and isinstance(content, str):
+            # Anthropic-style string tool result: require a JSON error
+            # envelope (the host's own error semantics), never the bare text
+            try:
+                inner = json.loads(content)
+            except json.JSONDecodeError:
                 continue
-            if part.get("is_error") is not True:
+            if not isinstance(inner, dict) or not isinstance(inner.get("error"), dict):
                 continue
             try:
-                body = json.dumps(part, ensure_ascii=False)
+                err_body = json.dumps(inner["error"], ensure_ascii=False)
             except (TypeError, ValueError):
                 continue
-            if needle in body:
+            if needle in err_body:
                 return True
     return False
 

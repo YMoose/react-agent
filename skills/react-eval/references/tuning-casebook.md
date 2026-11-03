@@ -10,7 +10,7 @@ Source-audit note (2026-11-03): historical numbers below are retained, not
 recomputed in this documentation pass. Cross-session input differences are
 descriptive, not controlled causal savings; usage differences and read-overlap
 metrics are proxies. The 120k warning is policy, and an empty resume does not
-prove context overflow. See `../../../reports/source-audit.md`.
+prove context overflow.
 
 ## Part A — Prompt Iteration Casebook
 
@@ -180,6 +180,26 @@ often than the prompt.
    user-interrupted child without a cancelled wrapper is indistinguishable
    from a restart kill until the host emits a reason code — host semantics
    gap, tracked upstream, not a grader fix.
+   *Follow-up (2026-11-03, string-content kill notices)*: the structure
+   gate above only recognized OpenAI-style content-part lists, but the
+   host emits Anthropic-style tool results as
+   `{"role": "tool", "content": "<json-string>"}` — and the kill notice
+   arrives exactly that way (`content` =
+   `{"error":{"type":"aborted","message":"Tool execution interrupted
+   (sessionID: …)"},"content":[]}`). Both children this fix targeted
+   (`ses_e7063a72…` → `ses_e706375e7…`, 57,217 tok, and
+   `ses_e68dff2d…` → `ses_e63550e6…`, 57,579 tok) therefore regressed to
+   `orphan_aborted_or_dropped` and back into C_rework. Fix:
+   `frame_kill_notice()` additionally accepts a string tool content only
+   when it parses to a JSON object with a non-empty `error` object
+   carrying the needle (the string twin of `is_error` + needle); bare
+   text that merely quotes the notice still does not match, and the
+   cancelled-wrapper exclusion is unchanged. Metric impact (ocg-obs
+   snapshot): both children reclassified `killed_by_host_restart`;
+   C_rework 114,796 → 0 tok, re-reported as "killed by host restart
+   (infra overhead) ≈ 114,796 tok across 2 children"; all other triage
+   stable (k=5 inline escape 12 tools / 59.4 min / +148,729 tok;
+   Peak(A) 274,198 / 219,348 / 207,989; ⚠polluted 18 of 90 boundaries).
 
 9. **Compaction ratchet never resets (Bug I, 2026-11-03)** — the async
    delivery scan claimed wrapper occurrences through a per-parent
