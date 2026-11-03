@@ -97,6 +97,37 @@ Expect boundaries to resolve as `sync`/`async` from anchored result wrappers,
 failed empty dispatches as `FAILED_DISPATCH`, and inflated `T_report` exacts
 to carry the `⚠polluted` marker.
 
+## Upstream Telemetry Gaps: Report, Don't Patch (上游采集缺陷：上报，不取巧修补)
+
+When the analyzer or an eval session finds missing, truncated, or ambiguous
+telemetry produced upstream — the `ocg-obs` exporter
+(`~/yzh/obsystem/opencode-genai-obs`), its wire JSONL, or host-emitted
+events/attributes — the default response is to **report the information gap
+upstream, not to paper over it with clever downstream patching**.
+
+1. **Classify the gap first**: grader-logic bug (fix here in a `scripts:`
+   commit with a casebook entry) vs. upstream data deficiency (dropped span,
+   truncated attribute, ambiguous semantics). The Phase 2 grader-integrity
+   gate is where this classification happens; never hillclimb prompts or
+   grader heuristics on data whose root cause lives upstream.
+2. **If upstream deficiency: write it up as an upstream requirement report**
+   with root-cause `path:line` evidence, sanitized session prefixes, a
+   concrete change spec, and an acceptance plan — then hand it to the
+   `ocg-obs` owner. Reference example: `~/yzh/obsystem/react-eval-and-tool-span-loss-report.md`
+   (2026-11-03: late tool terminals, `flushAll` fake-`OK`, user-cancel vs
+   host-kill ambiguity). Do not encode upstream data-shape assumptions into
+   our analyzer to make the symptom disappear.
+3. **Downstream workarounds are allowed only as labeled stopgaps**: the wire
+   JSONL fallback exists because upstream spans can be dropped or truncated;
+   it must stay visibly a fallback (documented in the casebook), never
+   silently promoted to "fixed" — otherwise the root cause never gets fixed
+   upstream and our assumptions break silently when its behavior changes.
+4. **Never invent semantics the host did not emit** (e.g. synthesizing
+   terminal statuses or reason codes). Classification rules for genuinely
+   ambiguous cases (e.g. `killed_by_host_restart`) must be structurally
+   gated, documented in the casebook, and reported upstream as an
+   information-gap request.
+
 ## Conventions
 
 - Keep Markdown imperative and concise; lowercase kebab-case filenames.
