@@ -84,7 +84,7 @@ transcripts.
 
 ## Part B — Grader & Telemetry Bug Archetypes
 
-Six real measurement bugs fixed in `scripts/phoenix_subagent_usage.py`.
+Twelve real measurement bugs fixed in `scripts/phoenix_subagent_usage.py`.
 Re-check these whenever a scorecard looks damning — the meter breaks more
 often than the prompt.
 
@@ -160,6 +160,87 @@ often than the prompt.
    parent wire for `Tool execution interrupted (sessionID: <sid>` and
    classifies such children `killed_by_host_restart` — consumed tokens are
    reported as infrastructure overhead, excluded from C_rework.
+   *Revision (2026-11-03, Bug I–L commit)*: the needle match is now
+   STRUCTURE-gated — the notice must sit in a
+   `messages[*].content[*].type == "tool_result"` part with `is_error` true;
+   a bare substring scan of the whole frame also matched plain-text
+   discussions that merely quoted the notice (one eval session carried
+   `125+` occurrences in its own reasoning) and user interrupts produce a
+   byte-identical tool_result (no reason code). Children with a
+   `state="cancelled"` wrapper in the parent wire are excluded (user
+   interrupt, not restart). Residual ambiguity: an orphaned
+   user-interrupted child without a cancelled wrapper is indistinguishable
+   from a restart kill until the host emits a reason code — host semantics
+   gap, tracked upstream, not a grader fix.
+
+9. **Compaction ratchet never resets (Bug I, 2026-11-03)** — the async
+   delivery scan claimed wrapper occurrences through a per-parent
+   `wire_claimed` ratchet that only ever grew. Compaction removes older
+   wrappers from the parent context, so the visible per-frame occurrence
+   count DROPS (ses_e7988dd44…, child ses_e644872f8…: count 4 → compaction
+   → 2 → new wrapper → 3), while the claim stayed at 4 ⇒
+   `required = claimed + 1 = 5` was unreachable forever and the boundary was
+   booked `delivery=none / running / UNKNOWN` even though its wrapper was
+   sitting in the next frames. Fix: per-child compaction drops are detected
+   between adjacent wire frames (count decrease); claims made before a drop
+   are reset to the still-visible count, and a mid-window drop resets the
+   in-flight `required`. Verified: ses_e7988dd44… k=21 now delivers its
+   `state="cancelled"` wrapper (11:41:59) instead of `running`.
+
+10. **Raw open-tag count ≠ parsed hits skips deliverable frames (Bug J,
+    2026-11-03)** — the baseline/occurrence currency was
+    `frame.count(open_tag)` (raw `str.count`), which also counts truncated
+    remnants: an unclosed echo of an earlier wrapper inflates the count by
+    one. Two failure shapes: (a) a frame whose raw count reaches
+    `required` but whose parsed hits are one short was skipped entirely even
+    though the hits list already contained the target child's own wrapper
+    (ses_e7edada63… k=4: raw=4 vs parsed=3 — the parsed 3rd hit WAS k4's);
+    (b) the inflated baseline shifted every later warm occurrence index by
+    one (ses_e7edada63… k=2 bound k3's wrapper at 03:16:53 and k3 bound
+    k4's at 03:47:40 — off-by-one against their true frames 03:00:07 /
+    03:16:53). Fix: the ONLY claim currency is the parsed hit count —
+    `subagent_wrappers` requires a closed `</subagent>` (both regex forms),
+    occurrences are deduplicated per frame by wrapper identity
+    (sid, state, description, whitespace-normalized report — a wrapper can
+    appear twice in one frame, escaped tool_result copy + plain
+    re-serialized copy), the parser now also digs into
+    `tool_result.content` (sync dispatch results live there; the Fix A
+    binding guard was blind to every sync delivery frame), and the escaped
+    raw-body fallback no longer double-counts parsed message bodies. Raw
+    counts are kept out of every skip decision.
+
+11. **Warm-resume shared wrapper booked as undelivered (Bug K, 2026-11-03)**
+    — one terminal wrapper of a child can cover several boundaries of the
+    same parent (merged report: ses_e6422a2e7… k1+k2 — the wrapper opens
+    "Both checks are complete" — and k3+k4). The occurrence index is claimed
+    by the first boundary, so the later boundary's `required = claimed + 1`
+    can never be met: `delivery=none / running / UNKNOWN` for a boundary
+    whose child actually finished and whose report DID enter the parent
+    context. Fix: when the child has terminal wrappers post-launch, every
+    visible occurrence is already claimed, and no new one ever appears, the
+    boundary is classified `delivery="shared_wrapper"` with an informative
+    `SHARED_DELIVERY` verdict (not UNKNOWN, not FAILED, not in the rework or
+    savings ledgers — the report was absorbed by the earlier boundary, so
+    T_report/NCR stay unknown for it; protocol_state takes the shared
+    wrapper's terminal state). The description match (first 40 chars,
+    normalized) is recorded as `shared_desc_match` evidence: exact match
+    means the wrapper carried this boundary's description; otherwise the
+    merged-report reading (the ses_e6422a2e7… k2/k4 case: wrapper
+    descriptions belong to k1/k3 while the report answers both).
+
+12. **Cancelled terminal state never written back (Bug L, 2026-11-03)** —
+    (a) the `hit["state"] → protocol_state` write-back existed but was
+    unreachable behind the Bug I ratchet (fixed by 9); (b) collected
+    `task_cancel` events only ever decorated `rework_tokens` and never
+    touched `protocol_state`, so a user-interrupted child with no terminal
+    wrapper stayed `running` forever (the host drops interrupted children
+    without a wrapper unless the notification path emits a
+    `state="cancelled"` one). Fix: each `task_cancel` event maps to the
+    latest dispatch of its target child that was live at cancel time and
+    still shows `running` with no resolved delivery → `protocol_state =
+    "cancelled"` (semantic `empty` when no report; ledger fields untouched).
+    Verified: ses_e7988dd44… k=21 (child ses_e644872f8…, user-cancelled)
+    renders `cancelled`, via (a) once Bug I/Bug J let the wrapper through.
 
 Related measurement refinement (same date): `Δpeak_self = Peak(R) − in(R_1)`
 now separates sessions born with a huge first prompt (e.g. peak `204,458`

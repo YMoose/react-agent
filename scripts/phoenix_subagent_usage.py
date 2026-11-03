@@ -47,12 +47,18 @@ last span), and Δt_parallel = Σ child_exec − merged window union.
 Native-notification delivery is resolved from the parent's untruncated wire
 JSONL: inside serialized request bodies the wrapper quotes are JSON-escaped
 (a plain-quote regex never matches), and the wrapper persists in every later
-request, so delivery = the first post-launch frame whose occurrence count
-for the child exceeds the count at launch (a warm re-dispatch of the same
-child adds a second wrapper). The same wire log rescues completed dispatches
-whose parent ``execute_tool subagent`` TOOL span was dropped by the exporter
-(they would otherwise be miscounted as orphan waste), alongside the
-self-acquired context growth ΔPeak_self = Peak − in(R_1) that separates
+request, so delivery = the first post-launch frame whose parsed-and-deduped
+occurrence count for the child exceeds the count at launch (a warm re-dispatch
+of the same child adds a second wrapper). Compaction drops older wrappers
+from the parent context mid-session, so the per-child occurrence counter can
+go DOWN between adjacent frames; the claim ratchet resets to the visible
+count at that point instead of chasing an unreachable index. A warm-resume
+boundary whose child emitted one shared terminal wrapper (merged report)
+that an earlier boundary already claimed resolves to ``shared_wrapper``
+instead of an undeliverable ``none``. The same wire log rescues completed
+dispatches whose parent ``execute_tool subagent`` TOOL span was dropped by
+the exporter (they would otherwise be miscounted as orphan waste), alongside
+the self-acquired context growth ΔPeak_self = Peak − in(R_1) that separates
 sessions born with a huge first prompt from self-bloated ones.
 
 All formulas are grounded in OTel GenAI semconv attributes
@@ -618,12 +624,14 @@ def subagent_wrappers(body: str, child_session: str | None = None) -> list[dict[
     if not body:
         return hits
     chunks: list[str] = [body]
+    parsed_messages = False
     if body.lstrip().startswith("{"):
         try:
             payload = json.loads(body)
         except json.JSONDecodeError:
             payload = None
         if isinstance(payload, dict) and isinstance(payload.get("messages"), list):
+            parsed_messages = True
             chunks = []
             for msg in payload["messages"]:
                 if not isinstance(msg, dict):
@@ -633,8 +641,26 @@ def subagent_wrappers(body: str, child_session: str | None = None) -> list[dict[
                     chunks.append(content)
                 elif isinstance(content, list):
                     for part in content:
-                        if isinstance(part, dict) and isinstance(part.get("text"), str):
+                        if not isinstance(part, dict):
+                            continue
+                        if isinstance(part.get("text"), str):
                             chunks.append(part["text"])
+                        # Bug J completion (2026-11-03): sync dispatch results
+                        # carry their wrapper inside a tool_result part —
+                        # ``content: [{"type":"tool_result", content: …}]``
+                        # (string or nested text parts). Without digging into
+                        # that slot the parser was blind to every sync-result
+                        # wrapper, so the parsed occurrence counts under-
+                        # counted (and Fix A's consume-frame binding could not
+                        # see the sync delivery frame at all).
+                        if part.get("type") == "tool_result":
+                            inner = part.get("content")
+                            if isinstance(inner, str):
+                                chunks.append(inner)
+                            elif isinstance(inner, list):
+                                for sub in inner:
+                                    if isinstance(sub, dict) and isinstance(sub.get("text"), str):
+                                        chunks.append(sub["text"])
     for chunk in chunks:
         for m in SUBAGENT_WRAPPER_RE.finditer(chunk):
             hits.append(
@@ -645,9 +671,12 @@ def subagent_wrappers(body: str, child_session: str | None = None) -> list[dict[
                     "report": m.group(4),
                 }
             )
-    if len(chunks) == 1:
+    if not parsed_messages:
         # raw body that did not parse into messages (truncated span bodies,
-        # non-request JSON): also scan the escaped form directly
+        # non-request JSON): also scan the escaped form directly. Never both:
+        # a body that DID parse already yields plain-quote hits from the
+        # parsed chunks, and scanning the escaped raw form too would
+        # double-count every tool_result-nested wrapper.
         for m in SUBAGENT_WRAPPER_ESCAPED_RE.finditer(body):
             try:
                 report = json.loads('"' + m.group(4) + '"')
@@ -664,6 +693,107 @@ def subagent_wrappers(body: str, child_session: str | None = None) -> list[dict[
     if child_session:
         hits = [h for h in hits if h["sid"] == child_session]
     return hits
+
+
+def wrapper_identity(hit: dict[str, str]) -> tuple[str, str, str, str]:
+    """Stable identity of one wrapper occurrence (Bug I/J hardening).
+
+    The same terminal wrapper can appear more than once inside a single wire
+    frame — an escaped ``\\"``-quoted tool_result copy plus a plain-quote
+    re-serialized copy (compaction frames), or a truncation-recovered echo.
+    Identity = (sid, state, description, whitespace-normalized report), so
+    duplicate copies collapse to one occurrence while genuinely distinct
+    wrappers (different reports, even with the same description) stay apart.
+    """
+    return (
+        hit["sid"],
+        hit["state"],
+        hit["description"] or "",
+        " ".join((hit["report"] or "").split()),
+    )
+
+
+def frame_wrapper_scan(wire_records: list[dict[str, Any]]) -> list[list[dict[str, str]]]:
+    """Per-frame deduplicated wrapper occurrence lists for one parent.
+
+    One pass over the parent's wire records (record order): every frame is
+    parsed once by ``subagent_wrappers`` and the hits are deduplicated by
+    ``wrapper_identity``. The parsed, closed ``</subagent>`` hit list is the
+    ONLY claim currency (Bug J): raw open-tag ``str.count`` also counts
+    truncated remnants, which silently offset baselines and skip frames that
+    already contain the target child's wrapper.
+    """
+    out: list[list[dict[str, str]]] = []
+    for wr in wire_records:
+        seen: set[tuple[str, str, str, str]] = set()
+        dedup: list[dict[str, str]] = []
+        for hit in subagent_wrappers(wr["frame"], None):
+            key = wrapper_identity(hit)
+            if key in seen:
+                continue
+            seen.add(key)
+            dedup.append(hit)
+        out.append(dedup)
+    return out
+
+
+def frame_kill_notice(frame: str, needle: str) -> bool:
+    """True when the kill notice sits in a STRUCTURED tool_result slot.
+
+    Fix B hardening (Bug H revision, 2026-11-03): a bare substring scan of the
+    whole frame also matched plain-text discussions (an eval session quoted
+    the ``Tool execution interrupted`` notice string 125+ times in its own
+    reasoning) and the byte-identical tool_result a user interrupt produces.
+    Only ``messages[*].content[*].type == "tool_result"`` parts with
+    ``is_error == true`` and the needle inside count as kill notices.
+    """
+    try:
+        payload = json.loads(frame)
+    except json.JSONDecodeError:
+        return False
+    if not isinstance(payload, dict) or not isinstance(payload.get("messages"), list):
+        return False
+    for msg in payload["messages"]:
+        if not isinstance(msg, dict):
+            continue
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if not isinstance(part, dict) or part.get("type") != "tool_result":
+                continue
+            if part.get("is_error") is not True:
+                continue
+            try:
+                body = json.dumps(part, ensure_ascii=False)
+            except (TypeError, ValueError):
+                continue
+            if needle in body:
+                return True
+    return False
+
+
+def child_has_cancelled_wrapper(
+    wire_records: list[dict[str, Any]], child_session: str
+) -> bool:
+    """True when the parent's wire log carries a ``state="cancelled"`` wrapper.
+
+    A user interrupt of a running child produces a byte-identical error
+    tool_result to a host-restart kill (no reason code), but the host also
+    emits a cancelled terminal wrapper for the interrupted child. Such
+    children are NOT booked as ``killed_by_host_restart``.
+    """
+    for wr in wire_records:
+        for hit in subagent_wrappers(wr["frame"], child_session):
+            if hit["state"] == "cancelled":
+                return True
+    return False
+
+
+def normalized_desc(text: str | None) -> str:
+    """Casefolded, punctuation-stripped, whitespace-flattened description."""
+    flat = " ".join((text or "").lower().split())
+    return re.sub(r"[^\w\s]", "", flat)[:40]
 
 
 def classify_launch(result_text: str) -> tuple[str, str | None, str | None]:
@@ -973,6 +1103,12 @@ class DispatchBoundary:
     # dropped the true consume span) ⇒ exact T_report measured across the
     # restart gap is untrustworthy; the char-based estimate stays effective.
     restart_interleaved: bool = False
+    # Bug K (2026-11-03): True when a warm-resume boundary consumed no wrapper
+    # of its own because the child's single terminal wrapper (merged report)
+    # was already claimed by an earlier boundary of the same parent —
+    # delivery="shared_wrapper", verdict SHARED_DELIVERY (informative; the
+    # report was absorbed by the earlier boundary, T_report/NCR unknown).
+    shared_desc_match: bool = False
     body_source_k: str = ""
     body_truncated_k: bool = False
     # actor execution inside the dispatch window
@@ -1058,6 +1194,7 @@ class DispatchBoundary:
             "t_report_polluted": self.t_report_polluted,
             "t_report_effective": self.t_report_effective,
             "restart_interleaved": self.restart_interleaved,
+            "shared_desc_match": self.shared_desc_match,
             "snippet_source": self.snippet_source,
             "ncr_char": round(self.ncr_char, 2) if self.ncr_char else None,
             "ncr_ctx": round(self.ncr_ctx, 2) if self.ncr_ctx else None,
@@ -1261,6 +1398,32 @@ def build_economics(
         )
         wire_records = wire_records_of(sid)
         wire_frames = {str(wr["seq"]): wr["frame"] for wr in wire_records}
+        # Bug J (2026-11-03): one parsed, deduped wrapper-occurrence list per
+        # wire frame — the ONLY claim currency for async delivery resolution.
+        # Raw open-tag str.count also counts truncated remnants (an unclosed
+        # echo of an earlier wrapper), which offset baselines and made the
+        # old code skip frames that already contained the target child's own
+        # wrapper (ses_e7edada63 k=4: raw=4 vs parsed=3 — the 4th occurrence
+        # WAS k4's, but the frame was skipped because 3 < 4).
+        frame_wrappers = frame_wrapper_scan(wire_records)
+        frame_child_counts = [Counter(h["sid"] for h in hits) for hits in frame_wrappers]
+        # Bug I (2026-11-03): compaction drops wrappers from the parent
+        # context, so a child's visible per-frame occurrence count can go
+        # DOWN between adjacent frames. Record every drop (ts, new visible
+        # count) per child: claims made before a drop must be reset to the
+        # count still visible, otherwise required = claimed + 1 chases an
+        # occurrence index that no longer exists (ses_e7988dd44 k=21: count
+        # 4 → compaction 2 → claim stuck at 4 ⇒ required 5 unreachable ⇒
+        # delivery=none for a boundary whose cancelled wrapper WAS there).
+        child_drops: dict[str, list[tuple[datetime | None, int]]] = defaultdict(list)
+        prev_child_counts: dict[str, int] = {}
+        for wr, counts in zip(wire_records, frame_child_counts):
+            for child in set(prev_child_counts) | set(counts):
+                cnt = counts.get(child, 0)
+                prev_cnt = prev_child_counts.get(child, 0)
+                if cnt < prev_cnt:
+                    child_drops[child].append((wr["ts_dt"], cnt))
+                prev_child_counts[child] = cnt
         # task_status(result=true) pulls indexed by target session for this parent
         pulls_by_child: dict[str, list[dict[str, Any]]] = {}
         for evt in task_events.get(sid, {}).get("pulls", []):
@@ -1269,6 +1432,9 @@ def build_economics(
         # Bug 1 (2026-11-01): highest wrapper occurrence index already claimed
         # per child by an earlier dispatch of this parent — a warm re-dispatch
         # of the same child must resolve to ITS OWN (later) wrapper.
+        # Bug I (2026-11-03): claims made before a compaction drop are reset
+        # to the still-visible count (see child_drops above), so the ratchet
+        # stays meaningful after the parent context was compacted.
         wire_claimed: dict[str, int] = {}
         # §4.2.4 [M2]: every child session of this parent — used to detect
         # cold-spawn cross-child re-reads against prior dispatch windows.
@@ -1359,31 +1525,59 @@ def build_economics(
                 # frame whose occurrence count for this child EXCEEDS the
                 # count at launch (a warm re-dispatch adds a 2nd wrapper).
                 if rec.child_session:
-                    esc_open = '<subagent sessionID=\\"' + rec.child_session + '\\"'
-                    plain_open = '<subagent sessionID="' + rec.child_session + '"'
+                    child = rec.child_session
 
-                    def wire_count(wr: dict[str, Any]) -> int:
-                        return wr["frame"].count(esc_open) + wr["frame"].count(plain_open)
+                    def wr_count(idx: int) -> int:
+                        # parsed, deduped occurrence count of this child in
+                        # wire frame idx — Bug J: never the raw open-tag count
+                        return frame_child_counts[idx].get(child, 0)
 
-                    baseline = 0
-                    for wr in wire_records:
+                    # baseline: parsed count in the last frame at/before launch
+                    baseline_idx = -1
+                    for idx, wr in enumerate(wire_records):
                         rdt = wr["ts_dt"]
                         if rdt and t0 and rdt <= t0:
-                            baseline = wire_count(wr)
-                    required = max(
-                        baseline + 1, wire_claimed.get(rec.child_session, 0) + 1
-                    )
-                    for wr in wire_records:
+                            baseline_idx = idx
+                    baseline = wr_count(baseline_idx) if baseline_idx >= 0 else 0
+                    # Bug I: apply compaction drops that happened at/before
+                    # this launch — reset the stale claim to the still-visible
+                    # count (a claim above what any later frame shows refers to
+                    # an occurrence index that compaction removed). A claim
+                    # above the pre-launch baseline WITHOUT a drop is the
+                    # legitimate warm-resume case (the wrapper appeared in a
+                    # frame between two dispatches) and must stand, so the
+                    # later boundary cannot re-claim the same occurrence.
+                    claimed = wire_claimed.get(child, 0)
+                    for drop_ts, new_cnt in child_drops.get(child, ()):
+                        if drop_ts is None or (t0 and drop_ts > t0):
+                            continue
+                        if claimed > new_cnt:
+                            wire_claimed[child] = new_cnt
+                            claimed = new_cnt
+                    required = max(baseline + 1, claimed + 1)
+                    prev_count = baseline
+                    for idx, wr in enumerate(wire_records):
                         rdt = wr["ts_dt"]
                         if not rdt or not t0 or rdt <= t0:
                             continue
-                        if wire_count(wr) < required:
+                        cnt = wr_count(idx)
+                        if cnt < prev_count:
+                            # compaction drop mid-window (Bug I): reset the
+                            # ratchet to the visible count
+                            required = min(required, cnt + 1)
+                            if wire_claimed.get(child, 0) > cnt:
+                                wire_claimed[child] = cnt
+                        prev_count = cnt
+                        if cnt < required:
                             continue
-                        hits = subagent_wrappers(wr["frame"], rec.child_session)
-                        if len(hits) < required:
-                            continue  # opening-tag count disagreed with the parse
+                        hits = [h for h in frame_wrappers[idx] if h["sid"] == child]
+                        # trust the parse: cnt == len(hits) by construction —
+                        # a frame whose parsed hits reach the required
+                        # occurrence ALWAYS delivers (Bug J: the old code
+                        # required the RAW count too and skipped frames where
+                        # a truncated remnant had inflated it)
                         hit = hits[required - 1]
-                        wire_claimed[rec.child_session] = required
+                        wire_claimed[child] = required
                         rec.report_delivery = "native_notification"
                         rec.protocol_state = hit["state"]
                         report_text = hit["report"].strip()
@@ -1394,6 +1588,50 @@ def build_economics(
                         rec.r_consume_start = wr["ts"]
                         link_consume(rdt)
                         break
+                    if rec.report_delivery == "none":
+                        # Bug K (2026-11-03): warm-resume shared wrapper. A
+                        # single terminal wrapper of the child can cover
+                        # several boundaries of the same parent (merged
+                        # report — ses_e6422a2e7 k1+k2 "Both checks are
+                        # complete", k3+k4): the occurrence index was claimed
+                        # by the first boundary, so later boundaries can never
+                        # reach required = claimed + 1 and were booked
+                        # delivery=none/running/UNKNOWN even though the child
+                        # finished and its report WAS delivered into the
+                        # parent context. Classify such boundaries
+                        # shared_wrapper / SHARED_DELIVERY (informative; the
+                        # report was absorbed by the earlier boundary, so
+                        # T_report/NCR stay unknown and the ledger does not
+                        # change).
+                        post_max = 0
+                        post_terminal: dict[tuple[str, str, str, str], dict[str, str]] = {}
+                        for idx, wr in enumerate(wire_records):
+                            rdt = wr["ts_dt"]
+                            if not rdt or not t0 or rdt <= t0:
+                                continue
+                            cnt = wr_count(idx)
+                            post_max = max(post_max, cnt)
+                            for h in frame_wrappers[idx]:
+                                if h["sid"] == child and h["state"] in (
+                                    "completed",
+                                    "cancelled",
+                                ):
+                                    post_terminal.setdefault(wrapper_identity(h), h)
+                        terminal_hits = list(post_terminal.values())
+                        desc_matched = any(
+                            rec.description
+                            and h["description"]
+                            and normalized_desc(h["description"]) == normalized_desc(rec.description)
+                            for h in terminal_hits
+                        )
+                        # every visible occurrence already claimed by an
+                        # earlier boundary AND a terminal wrapper exists ⇒
+                        # the report was shared, never missing
+                        if terminal_hits and claimed >= 1 and post_max <= claimed:
+                            rec.report_delivery = "shared_wrapper"
+                            rec.shared_desc_match = desc_matched
+                            rec.protocol_state = terminal_hits[-1]["state"]
+                            terminal_t = None  # window bounded by (c) as before
                 else:
                     # child id only resolvable at delivery time: take the
                     # first post-launch wrapper that no earlier dispatch of
@@ -1538,22 +1776,28 @@ def build_economics(
                     # do not harvest post_snippet from the post-restart span.
                     consume_wr = None
                     if rec.child_session:
-                        esc_open = '<subagent sessionID=\\"' + rec.child_session + '\\"'
-                        plain_open = '<subagent sessionID="' + rec.child_session + '"'
+                        # Bug J consistency (2026-11-03): the consume-frame
+                        # binding guard counts PARSED wrapper occurrences
+                        # (frame_child_counts), not raw open-tag str.count —
+                        # truncated remnants inflated the raw count and made
+                        # the "new occurrence" detection fire on frames that
+                        # carried no new closed wrapper.
+                        child = rec.child_session
 
-                        def _wr_count(wr: dict[str, Any]) -> int:
-                            return wr["frame"].count(esc_open) + wr["frame"].count(plain_open)
+                        def _wr_count(idx: int) -> int:
+                            return frame_child_counts[idx].get(child, 0)
 
-                        baseline = 0
-                        for wr in wire_records:
+                        baseline_idx = -1
+                        for idx, wr in enumerate(wire_records):
                             rdt = wr["ts_dt"]
                             if rdt and t1 and rdt <= t1:
-                                baseline = _wr_count(wr)
-                        for wr in wire_records:
+                                baseline_idx = idx
+                        baseline = _wr_count(baseline_idx) if baseline_idx >= 0 else 0
+                        for idx, wr in enumerate(wire_records):
                             rdt = wr["ts_dt"]
                             if not rdt or not t1 or rdt <= t1:
                                 continue
-                            if _wr_count(wr) > baseline:
+                            if _wr_count(idx) > baseline:
                                 consume_wr = wr
                                 break
                     covering = None
@@ -1627,6 +1871,12 @@ def build_economics(
                 # leave T_report unknown rather than fake a huge NCR
                 report = ""
                 rec.report_state = rec.protocol_state
+            if rec.report_delivery == "shared_wrapper":
+                # Bug K: the report WAS delivered into the parent context but
+                # absorbed by an earlier boundary of this parent — no report
+                # of its own to measure, ledger unchanged
+                report = ""
+                rec.report_state = rec.protocol_state
             rec.report_chars = len(report)
             rec.t_report_est = int(rec.report_chars / chars_per_token)
             # §1.2: the host reports a terminal protocol but the payload is
@@ -1634,6 +1884,10 @@ def build_economics(
             # simply has no report yet (stays unknown until delivery resolves).
             if report:
                 rec.status = parse_status(report)
+            elif rec.report_delivery == "shared_wrapper":
+                # shared delivery is not a degraded boundary — the report
+                # exists, just under an earlier boundary's account
+                rec.status = "unknown"
             else:
                 rec.status = "empty" if rec.protocol_state != "running" else "unknown"
             rec.has_issues_section = "Issues & Observations" in report or "Issues and Observations" in report
@@ -1804,6 +2058,14 @@ def build_economics(
             score = rec.ncr_ctx if rec.ncr_ctx is not None else rec.ncr_char
             if rec.verdict == "FAILED_DISPATCH":
                 pass  # already classified by the Bug B gate above
+            elif rec.report_delivery == "shared_wrapper":
+                # Bug K: informative verdict — the child finished and its report
+                # entered the parent context, but under an earlier boundary's
+                # occurrence claim. Not UNKNOWN (nothing is missing), not
+                # FAILED (the work happened); T_report/NCR are simply not
+                # attributable to this boundary, so it never enters the
+                # rework or savings ledgers either.
+                rec.verdict = "SHARED_DELIVERY"
             elif score is None:
                 rec.verdict = "UNKNOWN"
             elif rec.status in ("yielded", "blocked"):
@@ -1877,6 +2139,39 @@ def build_economics(
             dispatches.append(rec)
 
     dispatches.sort(key=lambda d: (d.parent_session, d.start))
+
+    # ---- Bug L (2026-11-03): cancelled terminal state write-back ------------
+    # task_cancel events were collected (polls/pulls/escalations/cancels) but
+    # only ever decorated `rework_tokens`; the cancelled child's dispatch kept
+    # protocol_state="running" forever when no wrapper ever arrived (user
+    # interrupt mid-run — the host drops the child without a terminal wrapper
+    # unless the notification path emits a state="cancelled" one). Map each
+    # cancel event to the dispatch of that child that was live at cancel time
+    # and still shows "running" with no resolved delivery → write "cancelled"
+    # (sync-side state, no ledger changes: T_report/NCR stay unknown).
+    for sid, ev in task_events.items():
+        for cancel_evt in ev.get("cancels", []):
+            target = cancel_evt.get("target")
+            ct = tso(cancel_evt.get("time") or "")
+            if not target or ct is None:
+                continue
+            candidates = [
+                d
+                for d in dispatches
+                if d.parent_session == sid
+                and d.child_session == target
+                and d.protocol_state in (None, "running")
+                and d.report_delivery in ("none", "sync_tool_result")
+                and (st := tso(d.start)) is not None
+                and st <= ct
+            ]
+            if not candidates:
+                continue
+            live = candidates[-1]  # latest dispatch of this child before the cancel
+            live.protocol_state = "cancelled"
+            if not live.report_chars:
+                # §1.2: terminal protocol + empty payload ⇒ semantic "empty"
+                live.status = "empty"
 
     # ---- Blind Spot D: child saturation waterline (Peak(A) < τ_rotate) -----
     # Peak(A) = the child session's peak input context (same meter as M4's
@@ -2002,14 +2297,26 @@ def build_economics(
         # attributable dropped work. Book as killed_by_host_restart; the
         # C_rework aggregation only counts orphan_aborted_or_dropped, so
         # these tokens are reported separately instead of as rework waste.
+        # Bug H revision (2026-11-03): the notice must sit in a STRUCTURED
+        # tool_result slot (messages[*].content[*].type == "tool_result" with
+        # is_error true) — a bare substring scan of the frame also matched
+        # plain-text discussions that merely quoted the notice (one eval
+        # session discussed it 125+ times in reasoning) and user interrupts
+        # produce a byte-identical tool_result (no reason code distinguishes
+        # them). A cancelled terminal wrapper for the child in the same wire
+        # log marks a user interrupt, not a host restart, so such children
+        # stay out of killed_by_host_restart (residual ambiguity documented
+        # in the casebook, awaiting an upstream reason code).
         if pid:
             kill_needle = "Tool execution interrupted (sessionID: %s" % sid
             kill_ts = ""
             for wr in wire_records_of(pid):
-                if kill_needle in wr["frame"]:
+                if frame_kill_notice(wr["frame"], kill_needle):
                     kill_ts = wr["ts"]
                     break
-            if kill_ts:
+            if kill_ts and not child_has_cancelled_wrapper(
+                wire_records_of(pid), sid
+            ):
                 bill = bills.get(sid)
                 orphan_children.append(
                     {
@@ -2411,6 +2718,7 @@ def render_economics(econ: dict[str, Any], chars_per_token: float) -> str:
                 rec.report_delivery.replace("sync_tool_result", "sync")
                 .replace("native_notification", "nat-notify")
                 .replace("task_status_pull", "pull")
+                .replace("shared_wrapper", "shared-wrap")
                 .replace("none", "⚠ none")
             )
             net_saved = (
@@ -2451,6 +2759,21 @@ def render_economics(econ: dict[str, Any], chars_per_token: float) -> str:
                     + (
                         f" (entered parent context at {rec.r_consume_start[11:19]})"
                         if rec.r_consume_start
+                        else ""
+                    )
+                    + (
+                        (
+                            " — the child's single terminal wrapper ("
+                            + (
+                                "description-matched, "
+                                if rec.shared_desc_match
+                                else "merged report, "
+                            )
+                            + "Bug K) was already claimed by an earlier boundary of "
+                            "this parent; the report was absorbed there, so "
+                            "T_report/NCR are not attributable to this boundary"
+                        )
+                        if rec.report_delivery == "shared_wrapper"
                         else ""
                     )
                 )
@@ -2616,9 +2939,14 @@ def render_economics(econ: dict[str, Any], chars_per_token: float) -> str:
             "`<subagent sessionID=… state=\"completed\">` wrapper was found in the parent's wire "
             "log — only the Phoenix `execute_tool subagent` TOOL span was dropped; real delivered "
             "work, excluded from orphan waste. `killed_by_host_restart` = the parent's wire log "
-            "records an explicit `Tool execution interrupted (sessionID: …)` kill notice — the "
-            "child was aborted by a host/server restart; its consumed tokens are infrastructure "
-            "overhead, never agent-attributable C_rework."
+            "records an explicit `Tool execution interrupted (sessionID: …)` kill notice in a "
+            "structured `tool_result` slot (`is_error` true) and no cancelled wrapper exists for "
+            "the child — the child was aborted by a host/server restart; its consumed tokens are "
+            "infrastructure overhead, never agent-attributable C_rework. A user interrupt of a "
+            "running child produces a byte-identical error tool_result (no reason code); the "
+            "cancelled-wrapper check keeps those out of this class, but orphaned user-interrupted "
+            "children without a wrapper remain an unavoidable ambiguity until the host emits a "
+            "reason code."
         )
         lines.append("")
 
