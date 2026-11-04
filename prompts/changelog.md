@@ -7,6 +7,21 @@ entries are sanitized of private paths, credentials, and raw user transcripts.
 
 ---
 
+## v3.7 — `orchestrator.md`: Context-Economic Routing for Single Known Files & Positive Motivation Framing
+
+- **Date**: 2026-11-04
+- **Files Changed**: `prompts/orchestrator.md` (replaced `<Role>` / `<ReAct Loop>` XML tags and `Strict Inline Prohibition` with `Context-Economic Routing` and `ReAct Collaboration Loop`; `prompts/fixer.md` unchanged)
+- **Trigger / Evidence**:
+  - User and telemetry observation on single-document reads/edits (and prior negative-net-value boundaries such as `k=6` with $\mathrm{NetSaved}_6 = -21{,}476\text{ tok}$): under `v3.4`–`v3.6`'s rigid `Strict Inline Prohibition` (*"Never run `read`… Your first tool call must be `subagent(agent=\"actor\")`"*), Reasoner was forced to spawn `actor` even when the user asked to read or update a single known document.
+  - Guided by `context-engineering/prompt-principes.md` (§1.1 ablation of redundant XML tags, §2.1 replacing negative `Never` prohibitions with positive motivation `Why`, and §4.2 avoiding subagent handoff tax on low-noise tasks), single-file reads/edits whose content Reasoner needs in context anyway yield $\Delta T_{\text{noise}} \approx 0$ ($\mathrm{NCR} \approx 1:1$) while paying double Decode tax $\beta \cdot (T_{\text{dispatch}} + T_{\text{report}})$ and second-hand summarization loss.
+- **Target Economics / Boundary**:
+  - Targets **Pre-Cut-A delegation gating** ($\mathrm{NetSaved}_k = \mathrm{Saved}_k - \beta(T_{\text{dispatch}, k} + T_{\text{report}, k}) > 0$, §2.1 & §4.2.3 $C_{\text{tx}}$): route single known file/doc/config tasks ($\le 2\text{–}3$ direct `read`/`edit`/`write` calls + optional single `git` sync command, zero search/test loops) inline so $C_{\text{tx}} = 0$ and $p_{\text{loss}} = 0$, while keeping multi-file work, `glob`/`grep` scouting, and script/test execution delegated to `actor` ($G_{\text{ctx}} \gg C_{\text{tx}}$) and preserving cold-rotation recovery on warm-session empty returns/saturation ($C_{\text{escape}} = 0$).
+- **Expected Metric Impact**:
+  - **M1 / M4 ($\mathrm{NCR}$, $\mathrm{NetSaved}_k$, $\mathrm{Friction}$)**: eliminate `MARGINAL_OVERHEAD` ($\mathrm{NCR} < 2:1$, $\mathrm{NetSaved}_k < 0$) dispatches on single-doc tasks and reduce handoff essay friction share.
+  - **M3 ($C_{\text{escape}}, p_{\text{loss}}$)**: zero second-hand summarization loss on direct document edits while maintaining $C_{\text{escape}} = 0$ on delegated tasks via positive cold-rotation recovery rules.
+
+---
+
 ## v3.6 — `orchestrator.md`: Outbound Goal/Why Curation (No Actor Scaffolding)
 
 - **Date**: 2026-11-03
