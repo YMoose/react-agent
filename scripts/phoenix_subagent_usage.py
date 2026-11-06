@@ -529,12 +529,15 @@ def dig(node: Any, *path: str) -> Any:
 
 
 def tso(value: str) -> datetime | None:
-    """Parse ISO-ish timestamps from either transport ("…T…Z" or "YYYY-MM-DD HH:MM:SS.ffffff")."""
+    """Parse GraphQL/wire timestamps and Phoenix's timezone-less SQLite UTC values."""
     if not value:
         return None
     text = value.strip().replace("Z", "+00:00").replace(" ", "T", 1) if "T" not in value else value.replace("Z", "+00:00")
     try:
-        return datetime.fromisoformat(text)
+        parsed = datetime.fromisoformat(text)
+        # Phoenix stores UTC in SQLite without an offset; delivery matching also
+        # consumes offset-aware wire timestamps and must compare the same clock.
+        return parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed
     except ValueError:
         return None
 

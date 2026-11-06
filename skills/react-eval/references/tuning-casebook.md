@@ -90,7 +90,7 @@ prove context overflow.
 
 ## Part B — Grader & Telemetry Bug Archetypes
 
-Twelve real measurement bugs fixed in `scripts/phoenix_subagent_usage.py`.
+Thirteen real measurement bugs fixed in `scripts/phoenix_subagent_usage.py`.
 Re-check these whenever a scorecard looks damning — the meter breaks more
 often than the prompt.
 
@@ -275,3 +275,15 @@ now separates sessions born with a huge first prompt (e.g. peak `204,458`
 with `in(R_1) = 168,545` ⇒ `Δ = 35,913`, born large) from self-bloated ones
 (`Δ = 266,860` on a `7,338`-token first turn) — check it before blaming a
 prompt for `Peak(R)`.
+
+13. **SQLite/wire timezone mismatch aborts offline evaluation (2026-11-06)** —
+    the November 4 onward review failed before producing its scorecard:
+    SQLite span timestamps contain UTC wall-clock values without offsets,
+    while wire `ts` values include `Z`. `tso()` preserved this difference,
+    so delivery matching raised `TypeError` when comparing naive and aware
+    datetimes. Phoenix's timestamp adapter restores UTC on database reads;
+    the analyzer's raw SQLite transport must do the same. Fix: attach UTC
+    only to parsed timestamps lacking an offset, retaining explicit offsets.
+    Stdlib regression tests first reproduced both cross-transport equality
+    failures, then verified delivery ordering, elapsed time, offset handling,
+    and unknown timestamps. This is a transport defect, not a prompt failure.
