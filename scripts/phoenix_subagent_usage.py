@@ -1167,8 +1167,8 @@ class DispatchBoundary:
     n_rem: int = 0  # raw: every parent LLM call after the report (cross-episode)
     n_rem_ep: int = 0  # episode-bounded: stops at next compaction or idle gap > τ_ep
     episode_end_reason: str | None = None  # compaction | idle_gap | session_end
-    dt_noise_tokens: int = 0
-    compounded_saved: int = 0  # Saved_k = N_rem^ep × ΔT_noise (episode-bounded)
+    dt_noise_tokens: int = 0  # raw_tok − report_tok, kept negative when the report exceeds the raw material
+    compounded_saved: int = 0  # Saved_k = N_rem^ep × ΔT_noise (episode-bounded; negative when ΔT_noise < 0)
     # §4.2.3 [M4]: decode-priced net savings + amortization horizon (β = c_out/c_in)
     net_saved_tokens: int | None = None
     n_rem_star: float | None = None
@@ -2071,7 +2071,12 @@ def build_economics(
                 rec.ncr_ctx = rec.actor_absorbed_tokens / report_tok
             if report_tok:  # unknown T_report (undelivered async) ⇒ savings unknowable
                 raw_tok = int(rec.actor_raw_result_chars / chars_per_token)
-                rec.dt_noise_tokens = max(raw_tok - report_tok, 0)
+                # ΔT_noise is NOT clamped: a report larger than the raw
+                # material it filtered is extra content the parent re-carries
+                # on every remaining episode turn, so Saved_k must go
+                # negative and deepen NetSaved_k (monotone in report size;
+                # zero-tool dispatches with raw=0 land at −T_report).
+                rec.dt_noise_tokens = raw_tok - report_tok
                 # Blind Spot E: N_rem^ep is the authoritative multiplier — raw
                 # cross-episode N_rem once counted unrelated turns hours later.
                 rec.compounded_saved = rec.n_rem_ep * rec.dt_noise_tokens
@@ -2085,6 +2090,7 @@ def build_economics(
                 )
                 boundary_cost = beta * (t_disp_used + report_tok)
                 rec.net_saved_tokens = round(rec.compounded_saved - boundary_cost)
+                # ΔT_noise ≤ 0 is unamortizable — no N*_rem threshold exists.
                 rec.n_rem_star = (
                     round(boundary_cost / rec.dt_noise_tokens, 2)
                     if rec.dt_noise_tokens > 0

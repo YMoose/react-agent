@@ -90,7 +90,7 @@ prove context overflow.
 
 ## Part B — Grader & Telemetry Bug Archetypes
 
-Fourteen real measurement bugs fixed in `scripts/phoenix_subagent_usage.py`.
+Fourteen real measurement bugs fixed in `scripts/phoenix_subagent_usage.py` — plus one scoring clamp removed (entry 15).
 Re-check these whenever a scorecard looks damning — the meter breaks more
 often than the prompt.
 
@@ -299,3 +299,26 @@ prompt for `Peak(R)`.
     one actual result pull, and one diagnostic read, versus one/six/one
     previously. This corrects measurement of already-observed behavior;
     it does not infer a new host lifecycle state.
+
+15. **Noise clamp hid report-larger-than-raw net context addition
+    (2026-11-06)** — `dt_noise_tokens = max(raw_tok − report_tok, 0)`
+    zeroed the economically-real case where the child's report is LARGER
+    than the raw material it filtered: a bigger report is extra content
+    the parent re-carries on every remaining episode turn, so
+    `Saved_k = N_rem^ep · ΔT_noise` must go negative and deepen
+    `NetSaved_k`. Zero-tool dispatches (raw=0) landed at `−T_report`.
+    Root cause: the clamp treated ΔT_noise as a saving that could only
+    be non-negative, conflating "no saving" with "negative saving".
+    Fix: retain the signed difference; `N*_rem` stays gated to
+    `ΔT_noise > 0` (an unamortizable boundary has no threshold), and
+    verdicts are unaffected (they key off NCR). Metric impact on the
+    ocg-obs snapshot: 21 boundaries now carry negative ΔT_noise
+    (Σ −13,015 tok); Σ compounded_saved 18,276,072 → 18,181,734; the
+    zero-tool cold dispatches in `ses_e6355599…` (k=1/k=2) moved from
+    net −2,244 to −2,803 each, and `ses_e799a9c6…` k=13 from −10,012
+    to −28,700 (N_rem^ep=8 × −2,336). Counts of `net_saved < 0`
+    boundaries are unchanged (39; 20 of 72 HIGH_GAIN) — clamped
+    boundaries were already negative, the fix only deepens them, making
+    NetSaved_k monotone in report size. This is the scoring prerequisite
+    for the v3.8 no-filter dispatch rule: the meter can now see a
+    report that costs more than the noise it filtered.
