@@ -1355,13 +1355,18 @@ def build_economics(
             target = params.get("sessionID") or params.get("task_id") or params.get("taskID")
             ts = span.get("startTime", "")
             if tname == "task_status":
-                if params.get("result") is True or str(params.get("result")).lower() == "true":
+                if params.get("diagnostic") is True or str(params.get("diagnostic")).lower() == "true":
+                    events["diagnostic_reads"] += 1
+                elif (
+                    (params.get("result") is True or str(params.get("result")).lower() == "true")
+                    and task_status_state(result_text) != "running"
+                ):
                     events["pulls"].append(
                         {"time": ts, "target": target, "result_chars": len(result_text), "result": result_text}
                     )
-                elif params.get("diagnostic") is True or str(params.get("diagnostic")).lower() == "true":
-                    events["diagnostic_reads"] += 1
                 else:
+                    # Asking for a result does not deliver one when the host
+                    # explicitly returns a running placeholder.
                     events["polls"] += 1
                     events["poll_result_chars"] += len(result_text)
                 m = WAITING_INPUT_RE.search(result_text)

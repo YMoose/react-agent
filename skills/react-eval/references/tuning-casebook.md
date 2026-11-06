@@ -90,7 +90,7 @@ prove context overflow.
 
 ## Part B — Grader & Telemetry Bug Archetypes
 
-Thirteen real measurement bugs fixed in `scripts/phoenix_subagent_usage.py`.
+Fourteen real measurement bugs fixed in `scripts/phoenix_subagent_usage.py`.
 Re-check these whenever a scorecard looks damning — the meter breaks more
 often than the prompt.
 
@@ -287,3 +287,15 @@ prompt for `Peak(R)`.
     Stdlib regression tests first reproduced both cross-transport equality
     failures, then verified delivery ordering, elapsed time, offset handling,
     and unknown timestamps. This is a transport defect, not a prompt failure.
+
+14. **Result-request placeholders hide polling (2026-11-06)** — five
+    `task_status(result=true)` calls in `ses_e5a5fdee…` returned only
+    `state: running`, but the analyzer counted them as report deliveries.
+    Classification followed the request flag without checking the response.
+    Fix: explicit running placeholders count as polls; real result pulls and
+    diagnostic reads remain separate. A synthetic end-to-end regression
+    through `build_economics()` failed before the fix and verifies all three
+    categories afterwards. The November 4 onward window has six polls,
+    one actual result pull, and one diagnostic read, versus one/six/one
+    previously. This corrects measurement of already-observed behavior;
+    it does not infer a new host lifecycle state.
