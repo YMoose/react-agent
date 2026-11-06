@@ -7,6 +7,25 @@ entries are sanitized of private paths, credentials, and raw user transcripts.
 
 ---
 
+## v3.8 — `orchestrator.md` & `fixer.md`: Poll-Cost Motivation, No-Filter Routing Guard, Acceptance-Evidenced Completed
+
+- **Date**: 2026-11-06
+- **Files Changed**: `prompts/orchestrator.md` (ReAct Loop step 1 polling clause; Routing section new bullet), `prompts/fixer.md` (Report Contract intro sentence)
+- **Trigger / Evidence**:
+  1. **Polling placeholders** (casebook Bug 14, `tuning-casebook.md:291-302`): five `task_status(result=true)` calls in `ses_e5a5fdee…` returned only `running` placeholders yet were booked as deliveries; meter fix `cc7f7e3` now scores them as polls (Nov-4+ window: 6 polls / 1 real pull / 1 diagnostic). The v3.7 "await notifications rather than polling" phrasing was a bare prohibition with no `why` and no bounded late-notification fallback.
+  2. **Zero-filter dispatches** (fresh Nov-6 run, 108 boundaries): 20 of 72 `HIGH_GAIN` boundaries have `net_saved < 0`; trivial cold dispatches ran ~0 tools (raw=0, report≈559 chars, net=−2,244 each), and `ses_e5e9d3d9ff…` `k=9` shows NCR_ctx=30.17 yet net=−6,756 — the v3.7 routing rule is file-shaped (single known file), not economics-shaped (nothing filtered).
+  3. **Claimed vs acceptance-passed** (benchmarks `## todo` item 1): `completed` (host) vs report-claims-completed vs acceptance-passed must be distinct facts; `fixer.md` previously allowed `Status: Completed` with no check evidence.
+- **Target Economics / Boundary**:
+  - Polling clause targets **`C_gov`/`C_poll`** (§4.2.5): each running-placeholder `task_status` re-bills the full parent context as an input turn; bounded `diagnostic: true` fallback caps governance cost without unbounded waiting.
+  - No-filter guard targets **`C_tx`** (§4.2.3, `NetSaved_k > 0`): steps whose child output is produced rather than filtered pay double Decode handoff tax for zero noise reduction.
+  - Acceptance evidence targets **`p_loss`/`C_risk`** (§4.2.6): the Cut B `Completed` semantic becomes verifiable at the boundary instead of trusted.
+- **Expected Metric Impact**:
+  - **M5 (`C_poll`)**: polls ≤ 1 diagnostic per lane; zero running-placeholder result pulls.
+  - **M1/M4 (`NetSaved_k`, `Friction`)**: eliminate zero-tool cold dispatches and report-larger-than-raw boundaries (`NetSaved_k < 0` count → 0 on new sessions).
+  - **M3/M6 (`p_loss`)**: claimed-completed vs acceptance-passed separable in every report.
+
+---
+
 ## v3.7 — `orchestrator.md`: Context-Economic Routing for Single Known Files & Positive Motivation Framing
 
 - **Date**: 2026-11-04

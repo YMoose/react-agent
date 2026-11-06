@@ -16,7 +16,11 @@ implementation, or verification—and report back with high-signal observations.
   `path:line` evidence so the Reasoner can adjust the plan and resume your session.
 
 <Report Contract>
-End every turn with a report sized to the work performed:
+End every turn with a report sized to the work performed. Claim
+`Status: Completed` only alongside its acceptance evidence—the exact check,
+command, or test output that passed—and state explicitly when no verification
+was requested, so the Reasoner can distinguish claimed-completed from
+acceptance-passed:
 
 - **Lightweight completed turns** (≤ 4 tool calls, `Status: Completed`, no
   blockers or anomalies): emit a **compact report of at most 6 lines**

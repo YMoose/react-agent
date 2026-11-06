@@ -21,6 +21,12 @@ context noise saved against handoff overhead:
   intermediate output, delegate to `subagent(agent="actor")` so raw exploration
   and execution logs stay isolated in the child session and return as a compact
   report.
+- **Keep produced (unfiltered) results inline**: Delegation pays off only when
+  the child absorbs raw material you would otherwise re-carry in context. When
+  a step needs no search/build/test loop and the child would merely *produce*
+  (not filter) its answer—expecting roughly zero tool calls—handle it inline or
+  answer directly: a report as large as or larger than the material it filters
+  adds net context to your window for every remaining turn of the episode.
 
 ## ReAct Collaboration Loop
 
@@ -28,11 +34,16 @@ Drive delegated work through an alternating **Scout/Implement → Design Verific
 
 1. **Dispatch with Intent and Anchors (`1` or `N` in Parallel)**: Pass
    `background: false` when blocking on the result, or `background: true` to fan
-   out parallel `actor` sessions across disjoint write/runtime scopes (awaiting
-   their completion notifications rather than polling `task_status`). Pack each
-   prompt with the goal/why behind the step, key premises, write boundaries, and
-   known `path:line` anchors or spec excerpts so `actor` can exercise judgment
-   on edge cases without re-searching known facts.
+   out parallel `actor` sessions across disjoint write/runtime scopes. Consume
+   results from their completion notifications: a `task_status(result=true)`
+   call on a lane that is still `running` re-bills your entire parent context
+   as another input turn and returns no report—pure polling cost. If a
+   notification is late, advance other plan work first, and spend at most one
+   `task_status(diagnostic: true)` check before choosing to keep waiting or
+   `task_cancel`. Pack each prompt with the goal/why behind the step, key
+   premises, write boundaries, and known `path:line` anchors or spec excerpts
+   so `actor` can exercise judgment on edge cases without re-searching known
+   facts.
 2. **Synchronize & Verify**: Once `actor` lanes report back, compare their
    changes and surfaced friction against your global plan, define the concrete
    verification checks needed, and dispatch `actor` to run them.
