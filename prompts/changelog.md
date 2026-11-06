@@ -7,6 +7,47 @@ entries are sanitized of private paths, credentials, and raw user transcripts.
 
 ---
 
+## v3.9 — `orchestrator.md`: Minimal First-Principles Routing & Surprise-Driven Pivot (Bitter Lesson Consolidation)
+
+- **Date**: 2026-11-06
+- **Files Changed**: `prompts/orchestrator.md` (consolidated the 25-line 3-bullet
+  `Context-Economic Routing (Inline vs. Delegate)` section into a single 12-line
+  natural-prose paragraph; `prompts/fixer.md` unchanged)
+- **Trigger / Evidence**:
+  1. In `ses_e4f01452…` (born on `v3.8`, `glm-5.3`), the user requested
+     compiling, packaging, and installing an extension project. Under `v3.8`'s
+     3-bullet routing structure (where bullets 1 and 3 both promoted inline
+     execution around a middle delegation bullet), the model skipped routing
+     deliberation across all 9 reasoning blocks (`0` mentions of
+     `subagent`/`actor`) and chained `19` inline tool calls (`shell×16,
+     read×2, glob×1`) even after the initial compile hit an uninitialized git
+     submodule and expanded into a multi-step build/troubleshooting loop.
+  2. Guided by `context-engineering/prompt-principes.md` (§1.1 *The Bitter
+     Lesson*—replace rigid case-list scaffolding with the core principle; §2.1
+     style matching via concise natural prose instead of stacked bullets; §3.1
+     surprise-driven re-evaluation), itemized posterior grading terms and
+     mechanical call-count buckets belong in the evaluator, whereas the runtime
+     model only needs the fundamental trade-off (persistent parent-window noise
+     vs. child isolation handoff round-trip), prior prediction before acting,
+     and a surprise-driven pivot when a quick inline step hits errors or
+     expands into a search/debug loop.
+- **Target Economics / Boundary**:
+  - Targets **Pre-Cut-A autonomous routing forecast** ($G_{\text{collab}} >
+    C_{\text{collab}}$, §2.1) and **mid-episode surprise pivot** (preventing
+    inline troubleshooting drift when initial low-noise predictions are
+    falsified), while reducing system-prompt scaffolding by 13 lines
+    (`62 -> 49` lines).
+- **Expected Metric Impact**:
+  - **M1 / M4** ($\mathrm{NCR}$, $\mathrm{NetSaved}_k$,
+    $\Delta\mathrm{Peak}_{\text{self}}$): preserve inline execution on genuinely
+    low-noise direct steps while restoring `actor` delegation whenever work
+    predicts high intermediate stream noise or when a quick inline check hits
+    build/test/search friction.
+  - **M3** ($C_{\text{escape}}$): prevent multi-turn inline troubleshooting
+    cascades after unexpected command/build errors.
+
+---
+
 ## v3.8 — `orchestrator.md` & `fixer.md`: Poll-Cost Motivation, No-Filter Routing Guard, Acceptance-Evidenced Completed
 
 - **Date**: 2026-11-06
