@@ -226,3 +226,15 @@ python3 obsystem/react-agent/scripts/phoenix_subagent_usage.py \
 - **F 孤儿/在途**：回归判定：`ses_e706375e7…`（父 `ses_e7063a72…` 重启丢 Span）与在途分类；实测结果：`ses_e706375e7…` 判 **`orphan_aborted_or_dropped`**（age 829 min，沉没 57,217 tok 计入 `C_rework`）；`in_flight_pending_parent` 分支经合成夹具验证（近期活跃 + 父静默 → 在途；老化 → 孤儿；父 `subagent` Span 窗口覆盖 → 无孤儿），当前快照无真实在途样本
 
 > 此附录记录的是 2026-10-31 分类。当前脚本还优先检查 Wire 送达证据、中断通知和默认 300s 的 `in_flight` 窗口；`in_flight_pending_parent` 默认 600s 且要求父无更新 Span。年龄以 trace 最大 Span 终点为水位，缺少时才用当前时间；近期性不能证明真实存活。旧 `ses_e706375e7…` 孤儿归类后来已被修订，见 casebook Bug H；其 `killed_by_host_restart` 标签本身仍有中断原因歧义。
+
+## todo
+
+对 react-agent 的方法论：
+
+1. 评分前先判断数据是否足够。
+   参数缺失、卸载补发、共享回传、用户取消要分别标记；只有证据充分的边界进入对应指标。completed、报告声称完成、验收通过，也应该分别记录。
+2. 拆开压缩效果、实际成本和估算收益。
+   这次 27 个边界被标为 HIGH_GAIN，但独立完成边界中有 14 个估算净收益为负。建议把这个标签改成“高压缩比”，避免暗示经济收益。
+   还有一个具体问题：当前计算 (react-agent/scripts/phoenix_subagent_usage.py:2074)把 原始输出量 − 报告量 截成非负数。报告更大时，应该保留负值，才能体现后续父窗口反复携带这些额外内容的成本。
+3. 建立可重复的评估样本，减少事后解释。
+   固定几类任务：已知文件读取、小修改、多文件调查、长构建、异步并行；控制模型、起始上下文和验收标准，再比较 inline、v3.6、v3.7。与此同时，把晚到通知、共享报告、序号重置、Code Mode 调用等案例做成脱敏回归样本。
