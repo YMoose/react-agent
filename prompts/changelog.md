@@ -7,6 +7,21 @@ entries are sanitized of private paths, credentials, and raw user transcripts.
 
 ---
 
+## v3.10 — orchestrator.md: Whole-Loop Noise Forecast & First-Probe Handoff on Surprise
+
+- **Date**: 2026-11-08
+- **Files Changed**: `prompts/orchestrator.md` (`Context-Economic Routing` paragraph refined; `prompts/fixer.md` unchanged)
+- **Trigger / Evidence**:
+  1. `v3.9` telemetry (`2026-11-06 13:30Z → 2026-11-08`, `ocg-obs`) confirmed that the minimal single-paragraph routing principle restored Turn-1 economic deliberation across `2/2` new `v3.9` sessions (`ses_e46a43bc2…` correctly chose inline on a 1-line `.gitignore` task with `Δpeak_self = +1,816` tok). However, in `ses_e466318e3…` (`10` turns, `33` tool spans: `shell×19, read×5, write×5, grep×1, edit×1`, `0` `subagent` calls, `Δpeak_self = +21,239` tok), Cut A reasoning traces exposed two specific economic illusions:
+     - **Background-shell isolation illusion (Turn 1)**: *"this could generate a lot of output noise. I should delegate to an actor subagent to run the refresh, or run it in background myself… The shell tool with `background: true` returns immediately and notifies when complete"* — overlooking that a parent's own background `shell` still delivers its output into the parent window.
+     - **Marginal single-probe slicing fallacy (Turn 3)**: When all 5 data fetchers failed (`ERR_CONNECTION_CLOSED`), the model recognized the pivot condition (*"This is now a debugging loop — could be noisy"*) but evaluated only the next single probe against the handoff cost (*"But the first probe is cheap and diagnostic. Let me do the curl probe inline first, then decide whether to delegate deeper debugging to an actor"*), then repeated that per-step justification across 5 diagnostic script iterations (`probe_stats.js` → `.cjs` → `probe2` → `probe3` → `probe4`).
+  2. Guided by `context-engineering/prompt-principes.md` (§2.1 *Provide Why over Negative Prohibitions* and §3.1 *Surprise-Driven Reasoning*), `v3.10` avoids negative bans or hard call counters and instead states the physical why: (a) direct tools—foreground or background—return output into the parent window; (b) the unit of economic prediction is the **cumulative noise of the whole sub-task loop** against a single handoff; and (c) because an unexpected error rarely resolves in one probe and compounds into multi-turn trial and error, the full diagnosis-and-fix loop is handed to `actor` starting from the first probe.
+- **Target Economics / Boundary**:
+  - Targets **Pre-Cut-A loop-level forecast** ($\sum_{t \in \text{loop}} \Delta T_{\text{noise}, t}$ vs single $C_{\text{tx}}$, §2.1 & §4.2.1) and **surprise-driven pivot at the first diagnostic probe** (preventing incremental sunk-cost drift in parent context).
+- **Expected Metric Impact**:
+  - **M1 / M4 ($\mathrm{NCR}$, $\mathrm{NetSaved}_k$, $\Delta\mathrm{Peak}_{\text{self}}$)**: trigger `actor` delegation on noisy data/build/test runs and multi-probe debugging loops while keeping genuinely direct, low-noise tasks (`Δpeak_self < 5k`) inline.
+  - **M3 ($C_{\text{escape}}$)**: eliminate multi-script inline debugging cascades triggered by the "just one cheap probe first" marginal fallacy.
+
 ## v3.9 — `orchestrator.md`: Minimal First-Principles Routing & Surprise-Driven Pivot (Bitter Lesson Consolidation)
 
 - **Date**: 2026-11-06

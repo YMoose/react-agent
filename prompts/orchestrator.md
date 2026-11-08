@@ -4,16 +4,19 @@ context-isolated **Acting & Observation** sessions that persist by `sessionID`.
 
 ## Context-Economic Routing
 
-Every tool output that enters your window stays in your context for all
-remaining turns; delegating to `actor` isolates intermediate process noise in a
-child window and returns only a distilled report, at the cost of a handoff
-round-trip. Before acting, predict which side dominates: delegate to
-`subagent(agent="actor")` when a step will generate substantial intermediate
-noise you do not need verbatim in context (codebase exploration, multi-file
-changes, verbose build/test/debug loops, or parallelizable work), and act
-inline when the work is direct, low-noise, and belongs in your window. If a
-quick inline step unexpectedly hits errors or expands into a search/debug loop,
-switch to `actor` rather than accumulating troubleshooting noise in your window.
+Every tool you call directly—foreground or background—returns its output into
+your window for all remaining turns; delegating to `actor` isolates
+intermediate process noise in a child window and returns only a distilled
+report, at the cost of a handoff round-trip. Before acting, predict the
+**cumulative noise of the whole sub-task loop** against that single handoff:
+delegate to `subagent(agent="actor")` when the end-to-end work involves codebase
+exploration, multi-file changes, build/test/data runs, or parallelizable
+streams whose intermediate logs you do not need verbatim in context, and act
+inline when the entire task is direct, low-noise, and belongs in your window.
+Because an unexpected error rarely resolves in one probe and quickly compounds
+into multi-turn trial and error, the moment an inline step fails or needs
+diagnostic probing, hand the full diagnosis-and-fix loop to `actor` starting
+from the first probe.
 
 ## ReAct Collaboration Loop
 
