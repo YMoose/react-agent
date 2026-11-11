@@ -565,9 +565,60 @@ def usage_of(attrs: dict[str, Any]) -> dict[str, int]:
         "input_tokens": u("input_tokens"),
         "output_tokens": u("output_tokens"),
         "reasoning_output_tokens": u("reasoning", "output_tokens"),
+        # standard-conformant since the first emission (plugin Bug 41 audit:
+        # "cache_read was already standard-conformant and is untouched")
         "cache_read_input_tokens": u("cache_read", "input_tokens"),
-        "cache_write_input_tokens": u("cache_write", "input_tokens"),
+        # --- LEGACY-DIALECT SHIM (removal candidate) ----------------------
+        # Primary path is the GenAI-semconv standard
+        # gen_ai.usage.cache_creation.input_tokens (the plugin dual-emits it
+        # alongside the legacy key with the same value since Bug 41,
+        # 06d09f3, 2026-11-10). The gen_ai.usage.cache_write.input_tokens
+        # fallback serves ONLY pre-Nov-10 spans — delete this fallback
+        # together with the finish_reasons JSON-string shim when pre-Nov-10
+        # data ages out of analysis windows.
+        "cache_creation_input_tokens": u("cache_creation", "input_tokens")
+        or u("cache_write", "input_tokens"),
     }
+
+
+# Finish reasons the GenAI semconv defines; provider-mapped spellings of the
+# same concepts are included, anything else buckets to "other" (opaque).
+KNOWN_FINISH_REASONS = {
+    "stop",
+    "length",
+    "tool_calls",
+    "tool-calls",
+    "content_filter",
+    "error",
+}
+
+
+def finish_reasons_of(attrs: dict[str, Any]) -> list[str]:
+    """``gen_ai.response.finish_reasons`` per the GenAI semconv (``string[]``).
+
+    Values are provider-mapped and opaque except for the known semconv
+    reasons (``length`` is the context-ceiling signal). The standard ARRAY
+    form is the only primary path.
+
+    --- LEGACY-DIALECT SHIM (removal candidate) --------------------------
+    The plugin emitted the array as a JSON-encoded string ('["stop"]') until
+    Bug 42 (f2120c8, 2026-11-10); every pre-Nov-10 span and most Nov-10
+    spans carry only that form. The string branch below exists solely for
+    them — delete it together with the cache_write fallback in usage_of
+    when pre-Nov-10 data ages out of analysis windows.
+    -----------------------------------------------------------------------
+    """
+    raw = dig(attrs, "gen_ai", "response", "finish_reasons")
+    if isinstance(raw, list):
+        return [str(v) for v in raw if isinstance(v, str)]
+    if isinstance(raw, str) and raw:
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            return []
+        if isinstance(parsed, list):
+            return [str(v) for v in parsed if isinstance(v, str)]
+    return []
 
 
 def is_compaction_span(span: dict[str, Any], attrs: dict[str, Any]) -> bool:
@@ -1108,6 +1159,10 @@ class SessionBill:
     # spec name `compaction_replaced`) — replaces wire-log guessing for the
     # Cut A post-compaction delegation-compliance check.
     compaction_events: int = 0
+    # Wave 2 (GenAI semconv): gen_ai.response.finish_reasons annotations —
+    # count-only observability, never an economic input.
+    length_stop_turns: int = 0
+    finish_reasons: Counter[str] = field(default_factory=Counter)
 
     @property
     def visible_output(self) -> int:
@@ -1144,6 +1199,8 @@ class SessionBill:
             "reads": classify_reads(self.reads),
             "tool_counts": dict(self.tool_counts),
             "compaction_events": self.compaction_events,
+            "length_stop_turns": self.length_stop_turns,
+            "finish_reasons": dict(self.finish_reasons),
         }
 
 
@@ -1411,6 +1468,15 @@ def build_economics(
                 bill.tot_cache_read += u["cache_read_input_tokens"]
                 bill.tot_output += u["output_tokens"]
                 bill.tot_reasoning += u["reasoning_output_tokens"]
+                # Wave 2: finish_reasons annotation (standard string[] primary,
+                # legacy JSON-string shim) — counts only, no economic effect.
+                frs = finish_reasons_of(attrs)
+                if frs:
+                    bill.finish_reasons.update(
+                        r if r in KNOWN_FINISH_REASONS else "other" for r in frs
+                    )
+                    if "length" in frs:
+                        bill.length_stop_turns += 1
                 if not bill.first:
                     bill.first = span.get("startTime", "")
                 bill.last = span.get("endTime", "")
@@ -2843,6 +2909,27 @@ def render_economics(econ: dict[str, Any], chars_per_token: float) -> str:
             "> native compaction events (opencode.observation.end_trigger "
             "`session.compaction.ended`/`compaction_replaced`): "
             + ", ".join(f"`{sid[:16]}…`×{n}" for sid, n in comp_sessions)
+        )
+        lines.append("")
+    # Wave 2: finish-reason annotation (gen_ai.response.finish_reasons).
+    fr_hist: Counter[str] = Counter()
+    len_stop_sessions = []
+    for b in bills.values():
+        fr_hist.update(b.finish_reasons)
+        if b.length_stop_turns:
+            len_stop_sessions.append((b.session_id, b.length_stop_turns))
+    if fr_hist:
+        bits = [f"{k}×{v}" for k, v in fr_hist.most_common()]
+        if len_stop_sessions:
+            bits.append(
+                "`length` stops: "
+                + ", ".join(f"`{sid[:16]}…`×{n}" for sid, n in len_stop_sessions)
+            )
+        else:
+            bits.append("`length` stops: 0 (no turn hit the output/context ceiling)")
+        lines.append(
+            "> finish reasons (gen_ai.response.finish_reasons, standard "
+            "string[] + legacy JSON-string shim): " + ", ".join(bits)
         )
         lines.append("")
 
