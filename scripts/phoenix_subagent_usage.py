@@ -1103,6 +1103,11 @@ class SessionBill:
     last: str = ""
     reads: list[ReadCall] = field(default_factory=list)
     tool_counts: Counter[str] = field(default_factory=Counter)
+    # Wave 1: native compaction events observed via
+    # opencode.observation.end_trigger (live form `session.compaction.ended`,
+    # spec name `compaction_replaced`) — replaces wire-log guessing for the
+    # Cut A post-compaction delegation-compliance check.
+    compaction_events: int = 0
 
     @property
     def visible_output(self) -> int:
@@ -1138,6 +1143,7 @@ class SessionBill:
             "visible_output_tokens": self.visible_output,
             "reads": classify_reads(self.reads),
             "tool_counts": dict(self.tool_counts),
+            "compaction_events": self.compaction_events,
         }
 
 
@@ -1185,6 +1191,20 @@ class DispatchBoundary:
     # dropped the true consume span) ⇒ exact T_report measured across the
     # restart gap is untrustworthy; the char-based estimate stays effective.
     restart_interleaved: bool = False
+    # Wave 1 (upstream opencode-genai-obs ≥ 2026-11-06, Bugs 34/35): exact
+    # delegation pairing + observation-end provenance + host interrupt enum.
+    # pairing_source: delegation_metadata (opencode.subagent.session_id,
+    # exact) | result_wrapper | resume_param | window_candidate | "" (unpaired)
+    pairing_source: str = ""
+    # heuristic child id that DISAGREED with the delegation metadata —
+    # surfaced, never silently resolved (measures the old heuristic's error)
+    pairing_conflict: str = ""
+    # "" (legacy span, attribute absent) | host_event (authoritative) |
+    # low(<end_source>) — a span closed at a flush/unload boundary
+    terminal_confidence: str = ""
+    # host-reported opencode.interrupt.reason values on the child's root
+    # observation spans ("user" = user interrupt, k=39 class); [] = legacy
+    interrupt_reason: list[str] = field(default_factory=list)
     # Wire-recovery (2026-11-10 class, ses_e828c9c15ffe k=27..38): True when
     # the exported TOOL span lost its result (error.type=interrupted, no
     # gen_ai.tool.call.result) and the report was recovered from the child's
@@ -1283,6 +1303,10 @@ class DispatchBoundary:
             "t_report_effective": self.t_report_effective,
             "restart_interleaved": self.restart_interleaved,
             "wire_recovered": self.wire_recovered,
+            "pairing_source": self.pairing_source,
+            "pairing_conflict": self.pairing_conflict,
+            "terminal_confidence": self.terminal_confidence,
+            "interrupt_reason": list(self.interrupt_reason),
             "shared_desc_match": self.shared_desc_match,
             "snippet_source": self.snippet_source,
             "ncr_char": round(self.ncr_char, 2) if self.ncr_char else None,
@@ -1322,6 +1346,24 @@ def _role_of(attrs: dict[str, Any]) -> str | None:
 
 def _parent_id_of(attrs: dict[str, Any]) -> str | None:
     return dig(attrs, "opencode", "session", "parent_id") or dig(attrs, "session", "parent_id")
+
+
+def session_interrupt_reasons(
+    items: list[tuple[dict[str, Any], dict[str, Any]]],
+) -> list[str]:
+    """Host-reported ``opencode.interrupt.reason`` values on a session's spans.
+
+    Emitted root-only by the host (Bug 34); ``user`` marks a user interrupt.
+    Empty list on legacy spans predating the attribute — callers must treat
+    absence as unknown, never as "no interrupt".
+    """
+    return sorted(
+        {
+            r
+            for _, a in items
+            if isinstance(r := dig(a, "opencode", "interrupt", "reason"), str) and r
+        }
+    )
 
 
 def build_economics(
@@ -1377,6 +1419,12 @@ def build_economics(
                 bill.tool_counts[tname] += 1
                 if tname == "read":
                     bill.reads.append(read_call_of(span, attrs))
+            # Wave 1: native compaction events (end_trigger carries
+            # `session.compaction.ended` live / `compaction_replaced` in the
+            # spec enum) — counted once per observed event span.
+            end_trigger = dig(attrs, "opencode", "observation", "end_trigger")
+            if isinstance(end_trigger, str) and "compaction" in end_trigger:
+                bill.compaction_events += 1
         bills[sid] = bill
 
     # ---- untruncated wire records (one JSONL per session, cached once) ------
@@ -1557,6 +1605,23 @@ def build_economics(
             rec.warm = bool(resume)
             rec.child_session = out_child or resume
 
+            # Wave 1 (Bug 35): opencode.subagent.session_id is derived ONLY
+            # from delegation metadata — the exact child of THIS dispatch.
+            # It outranks the result-wrapper/resume heuristics; when the
+            # heuristic disagrees the conflict is recorded and surfaced, not
+            # silently resolved. Legacy spans without the attribute keep the
+            # heuristic chain (result_wrapper → resume_param → window).
+            delegated_sid = dig(attrs, "opencode", "subagent", "session_id")
+            if isinstance(delegated_sid, str) and delegated_sid:
+                if rec.child_session and rec.child_session != delegated_sid:
+                    rec.pairing_conflict = rec.child_session
+                rec.child_session = delegated_sid
+                rec.pairing_source = "delegation_metadata"
+            elif out_child:
+                rec.pairing_source = "result_wrapper"
+            elif resume:
+                rec.pairing_source = "resume_param"
+
             # cold start: find the child spawned by this parent inside the window
             if not rec.child_session:
                 candidates = [
@@ -1567,6 +1632,7 @@ def build_economics(
                     ft = tso(first_span.get("startTime", ""))
                     if ft and t0 and t1 and t0 <= ft <= t1:
                         rec.child_session = cand
+                        rec.pairing_source = "window_candidate"
                         break
 
             # --- async completion resolution ----------------------------------
@@ -1898,6 +1964,25 @@ def build_economics(
                     # index is this dispatch's own abort — no recovery
                     break
 
+            # Wave 1: observation-end provenance (opencode.observation.
+            # end_source). A terminal observed via a real host event is
+            # authoritative; a span the plugin closed at a flush/unload
+            # boundary contributes a GUESSED protocol state, not an observed
+            # one — null it unless independent evidence (wire recovery, async
+            # delivery resolution) carries the state instead. Legacy spans
+            # without the attribute keep the legacy behaviour.
+            obs_end = dig(attrs, "opencode", "observation", "end_source")
+            if isinstance(obs_end, str) and obs_end:
+                rec.terminal_confidence = (
+                    "host_event" if obs_end == "host_event" else f"low({obs_end})"
+                )
+                if (
+                    obs_end != "host_event"
+                    and not rec.wire_recovered
+                    and rec.report_delivery == "sync_tool_result"
+                ):
+                    rec.protocol_state = None
+
             # R_k: parent LLM span whose window contains the dispatch start
             if rec.r_k_in is None:
                 for llm_span, llm_attrs in parent_llm:
@@ -2065,6 +2150,19 @@ def build_economics(
             if rec.child_session and rec.child_session in by_session:
                 child_items = sorted(
                     by_session[rec.child_session], key=lambda p: p[0].get("startTime", "")
+                )
+                # Wave 1 (Bug 34): host-reported interrupt enum on the child's
+                # root observation spans — exact interrupt label ("user" =
+                # user interrupt, k=39 class); absent on legacy spans.
+                rec.interrupt_reason = sorted(
+                    {
+                        r
+                        for _, ca in child_items
+                        if isinstance(
+                            r := dig(ca, "opencode", "interrupt", "reason"), str
+                        )
+                        and r
+                    }
                 )
                 child_llm = [
                     (s, a)
@@ -2411,6 +2509,9 @@ def build_economics(
         items = by_session.get(sid) or []
         if not items:
             continue
+        # Wave 1 (Bug 34): exact host interrupt label for this child, when
+        # the host emitted one; [] on legacy spans (unknown, not "none").
+        kid_reasons = session_interrupt_reasons(items)
         first_start = tso(items[0][0].get("startTime", ""))
         child_ends = [
             tso(s.get("endTime", "")) or tso(s.get("startTime", "")) for s, _ in items
@@ -2460,6 +2561,7 @@ def build_economics(
                     ),
                     "llm_n": bill.llm_n if bill else 0,
                     "consumed_tokens": consumed,
+                    "interrupt_reasons": kid_reasons,
                 }
             )
             continue
@@ -2490,12 +2592,20 @@ def build_economics(
             if kill_ts and not child_has_cancelled_wrapper(
                 wire_records_of(pid), sid
             ):
+                # Wave 1 (Bug 34): opencode.interrupt.reason on the child's
+                # root span is the host's own interrupt label — reason="user"
+                # relabels the kill as a user interrupt (agent-attributable,
+                # never host-restart waste); an absent attribute keeps the
+                # legacy killed_by_host_restart classification.
+                kill_cls = (
+                    "user_interrupt" if "user" in kid_reasons else "killed_by_host_restart"
+                )
                 bill = bills.get(sid)
                 orphan_children.append(
                     {
                         "session_id": sid,
                         "parent_id": pid,
-                        "classification": "killed_by_host_restart",
+                        "classification": kill_cls,
                         "age_s": None,
                         "first_span": items[0][0].get("startTime", ""),
                         "last_span_end": max(
@@ -2506,6 +2616,7 @@ def build_economics(
                         if bill
                         else 0,
                         "notice_ts": kill_ts,
+                        "interrupt_reasons": kid_reasons,
                     }
                 )
                 continue
@@ -2541,6 +2652,7 @@ def build_economics(
                 ),
                 "llm_n": bill.llm_n if bill else 0,
                 "consumed_tokens": consumed,
+                "interrupt_reasons": kid_reasons,
             }
         )
     orphan_children.sort(key=lambda o: (o["classification"], o["session_id"]))
@@ -2721,6 +2833,18 @@ def render_economics(econ: dict[str, Any], chars_per_token: float) -> str:
         "prompt (spec reload) — not bloated by its own inline tool noise."
     )
     lines.append("")
+    comp_sessions = sorted(
+        (b.session_id, b.compaction_events)
+        for b in bills.values()
+        if b.compaction_events
+    )
+    if comp_sessions:
+        lines.append(
+            "> native compaction events (opencode.observation.end_trigger "
+            "`session.compaction.ended`/`compaction_replaced`): "
+            + ", ".join(f"`{sid[:16]}…`×{n}" for sid, n in comp_sessions)
+        )
+        lines.append("")
 
     # Blind Spot D: child saturation waterline (Peak(A) < τ_rotate)
     if saturation:
@@ -2908,6 +3032,37 @@ def render_economics(econ: dict[str, Any], chars_per_token: float) -> str:
                 f"| {rec.protocol_state or '-'} | {rec.status} | {rec.verdict} |"
             )
         lines.append("")
+        # Wave 1 signal audit: exact-delegation pairing adoption + conflicts
+        # between the delegation metadata and the legacy heuristics.
+        n_del = sum(1 for rec in dispatches if rec.pairing_source == "delegation_metadata")
+        conflicts = [rec for rec in dispatches if rec.pairing_conflict]
+        low_conf = [rec for rec in dispatches if rec.terminal_confidence.startswith("low(")]
+        if n_del or conflicts or low_conf:
+            bits = [
+                f"{n_del}/{len(dispatches)} dispatches paired exactly via "
+                "opencode.subagent.session_id (legacy heuristic fallback elsewhere)"
+            ]
+            if conflicts:
+                bits.append(
+                    f"**{len(conflicts)} delegation-vs-heuristic CONFLICTS**: "
+                    + "; ".join(
+                        f"k={r.k} `{r.parent_session[:14]}…` exact=`{r.child_session[:16]}…`"
+                        f" heuristic=`{r.pairing_conflict[:16]}…`"
+                        for r in conflicts
+                    )
+                )
+            if low_conf:
+                bits.append(
+                    f"{len(low_conf)} low-confidence terminals (observation.end_source"
+                    "≠host_event): "
+                    + ", ".join(
+                        f"k={r.k}[{r.terminal_confidence}{'/wire-recovered' if r.wire_recovered else ''}]"
+                        for r in low_conf
+                    )
+                )
+            for bit in bits:
+                lines.append(f"> pairing/provenance: {bit}")
+            lines.append("")
 
         for rec in dispatches:
             lines.append(
@@ -2918,7 +3073,27 @@ def render_economics(econ: dict[str, Any], chars_per_token: float) -> str:
             lines.append(
                 f"- dispatch: `{rec.start[11:19]}→{rec.end[11:19]}` "
                 f"({rec.latency_s:.0f}s, {'warm ' + str(rec.child_session or '')[:22] if rec.warm else 'cold start ' + str(rec.child_session or '?')[:22]})"
+                + (
+                    f" — paired by delegation metadata"
+                    + (
+                        f" (overrode heuristic `{rec.pairing_conflict[:18]}…`)"
+                        if rec.pairing_conflict
+                        else ""
+                    )
+                    if rec.pairing_source == "delegation_metadata"
+                    else ""
+                )
+                + (
+                    f" — terminal {rec.terminal_confidence}"
+                    if rec.terminal_confidence.startswith("low(")
+                    else ""
+                )
             )
+            if rec.interrupt_reason:
+                lines.append(
+                    f"- interrupt: {', '.join(rec.interrupt_reason)} (host-reported "
+                    "opencode.interrupt.reason)"
+                )
             if rec.mode == "async":
                 exec_bit = (
                     f"child exec `{rec.child_start[11:19]}→{rec.child_end[11:19]}` "
@@ -3116,12 +3291,23 @@ def render_economics(econ: dict[str, Any], chars_per_token: float) -> str:
             "structured `tool_result` slot (`is_error` true) and no cancelled wrapper exists for "
             "the child — the child was aborted by a host/server restart; its consumed tokens are "
             "infrastructure overhead, never agent-attributable C_rework. A user interrupt of a "
-            "running child produces a byte-identical error tool_result (no reason code); the "
-            "cancelled-wrapper check keeps those out of this class, but orphaned user-interrupted "
-            "children without a wrapper remain an unavoidable ambiguity until the host emits a "
-            "reason code."
+            "running child produces a byte-identical error tool_result; since the host's "
+            "opencode.interrupt.reason (Bug 34) a reason=\"user\" root relabels such children "
+            "`user_interrupt` (agent-attributable, still excluded from C_rework); legacy children "
+            "without the attribute keep the unavoidable ambiguity noted above."
         )
         lines.append("")
+        flagged = [o for o in orphans if o.get("interrupt_reasons")]
+        if flagged:
+            lines.append(
+                "> host-reported interrupts (opencode.interrupt.reason): "
+                + "; ".join(
+                    f"`{o['session_id'][:16]}…`={','.join(o['interrupt_reasons'])} "
+                    f"(booked {o['classification']})"
+                    for o in flagged
+                )
+            )
+            lines.append("")
 
     total_saved = sum(rec.compounded_saved for rec in dispatches)
     total_escape_tok = sum(r.inline_escape_ctx_delta or 0 for r in dispatches)
