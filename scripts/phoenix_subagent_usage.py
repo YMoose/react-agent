@@ -69,8 +69,13 @@ reasoning parts) plus the OpenInference/OpenCode bridge attributes
 ``opencode.reasoning`` is kept only as the flat-mirror fallback of the
 native reasoning parts).  When a span body was truncated by the
 plugin's 60 KiB attribute budget the script falls back to the untruncated
-per-session wire JSONL (``~/.local/share/opencode/raw-requests/``), matching
-frames via ``opencode.wire.seq``.
+per-session wire JSONL (``~/.local/share/opencode/raw-requests/``), joining
+frames on the wire-schema pair (``opencode.wire.capture_id``,
+``opencode.wire.seq``) — the seq counter restarts at zero on every host
+restart, so seq alone misbinds frames across recorder instances; legacy
+pre-captureID spans keep nearest-``ts`` seq matching. Sync dispatches whose
+exported TOOL span lost its result attribute recover their report from the
+child's terminal ``<subagent>`` wrapper in the parent wire log.
 
 Stdlib only (urllib + sqlite3), no third-party dependencies.
 """
@@ -100,7 +105,12 @@ CHILD_AGENT_ROLES = {"actor", "worker"}
 DEFAULT_WIRE_DIR = Path.home() / ".local/share/opencode/raw-requests"
 
 # Actor report contract: an explicit "Status:" line wins, <subagent state="…"> fallback.
-STATUS_LINE_RE = re.compile(r"Status\s*[:：]\s*[`*]*(Completed|Yielded|Blocked)", re.IGNORECASE)
+# The `**`-tolerant classes cover both bold variants actors use —
+# "**Status: Completed**" and "**Status**: Completed" (the latter put the
+# stars between label and colon and previously never matched).
+STATUS_LINE_RE = re.compile(
+    r"Status\s*[`*]*\s*[:：]\s*[`*]*(Completed|Yielded|Blocked)", re.IGNORECASE
+)
 STATE_TAG_RE = re.compile(r'state="([a-z_]+)"')
 
 # --- async delegation patterns (mirrors oh-my-opencode-slim src/utils/task.ts) ---
@@ -919,7 +929,10 @@ def load_wire_records(wire_dir: Path | None, session_id: str) -> list[dict[str, 
     Records are ordered by their own ``ts`` — NOT by ``seq``: the JSONL seq
     counter resets across host restarts (and is a different namespace than
     the spans' ``opencode.wire.seq`` attribute), so file order + ``ts`` is
-    the only reliable chronology.
+    the only reliable chronology. Since the recorder's captureID fix
+    (opencode-genai-obs a745af1) every record carries ``capture_id`` (one
+    UUID per recorder instance; several instances share one session file
+    across restarts); legacy records predating it keep ``None``.
     """
     if not wire_dir:
         return []
@@ -941,9 +954,11 @@ def load_wire_records(wire_dir: Path | None, session_id: str) -> list[dict[str, 
                 if not isinstance(frame, str):
                     continue
                 ts = rec.get("ts")
+                cap = rec.get("captureID")
                 records.append(
                     {
                         "seq": rec.get("seq"),
+                        "capture_id": cap if isinstance(cap, str) and cap else None,
                         "ts": ts if isinstance(ts, str) else "",
                         "ts_dt": tso(ts) if isinstance(ts, str) else None,
                         "frame": frame,
@@ -955,22 +970,58 @@ def load_wire_records(wire_dir: Path | None, session_id: str) -> list[dict[str, 
     return records
 
 
-def wire_body(attrs: dict[str, Any], frames: dict[str, str]) -> tuple[str, bool, str]:
+def wire_body(
+    attrs: dict[str, Any], span_start: str, wire_records: list[dict[str, Any]]
+) -> tuple[str, bool, str]:
     """Full request body for an LLM span, preferring the untruncated JSONL frame.
 
     Returns (body, was_truncated, source). The plugin caps attributes at
     ``tracing.contentMaxLength`` (default 61440 UTF-8 bytes) and marks cuts
     with ``input.value_original_length``; the wire JSONL keeps whole frames.
+
+    Wire-schema contract (opencode-genai-obs ≥ a745af1 "Bug 37"): a span
+    joins its record on the PAIR (``opencode.wire.capture_id``,
+    ``opencode.wire.seq``) ↔ (``captureID``, ``seq``). One recorder instance
+    owns one seq namespace and the counter restarts at zero on every host
+    restart, so a seq-only lookup misbinds frames across instances — it must
+    never run where a capture_id exists (an unmatched pair falls back to the
+    span's own body instead of borrowing another instance's frame). Legacy
+    spans without a capture_id keep seq-only matching restricted to legacy
+    records, disambiguated by the record whose ``ts`` is closest to the span
+    start (the record IS the request, so the true frame is temporally
+    nearest).
     """
     raw = dig(attrs, "input", "value")
     original = dig(attrs, "input", "value_original_length")
+    if not wire_records or original is None:
+        if isinstance(raw, str):
+            return raw, original is not None, "span"
+        return "", False, "-"
+    cap = dig(attrs, "opencode", "wire", "capture_id")
     seq = dig(attrs, "opencode", "wire", "seq")
-    if original is not None and frames:
-        frame = frames.get(str(seq))
-        if frame is not None:
-            return frame, True, f"wire.seq={seq}"
+    if isinstance(cap, str) and cap:
+        for wr in wire_records:
+            if wr["capture_id"] == cap and str(wr["seq"]) == str(seq):
+                return wr["frame"], True, f"wire({cap[:8]},{seq})"
+        if isinstance(raw, str):
+            return raw, True, "span"
+        return "", False, "-"
+    span_dt = tso(span_start)
+    best: dict[str, Any] | None = None
+    best_gap: float | None = None
+    for wr in wire_records:
+        if wr["capture_id"] or str(wr["seq"]) != str(seq):
+            continue
+        if span_dt is None or wr["ts_dt"] is None:
+            best = best or wr
+            continue
+        gap = abs((wr["ts_dt"] - span_dt).total_seconds())
+        if best is None or best_gap is None or gap < best_gap:
+            best, best_gap = wr, gap
+    if best is not None:
+        return best["frame"], True, f"wire.seq={seq}"
     if isinstance(raw, str):
-        return raw, original is not None, "span"
+        return raw, True, "span"
     return "", False, "-"
 
 
@@ -1134,6 +1185,12 @@ class DispatchBoundary:
     # dropped the true consume span) ⇒ exact T_report measured across the
     # restart gap is untrustworthy; the char-based estimate stays effective.
     restart_interleaved: bool = False
+    # Wire-recovery (2026-11-10 class, ses_e828c9c15ffe k=27..38): True when
+    # the exported TOOL span lost its result (error.type=interrupted, no
+    # gen_ai.tool.call.result) and the report was recovered from the child's
+    # terminal <subagent> wrapper in the parent wire log — an explicitly
+    # labeled fallback; no wrapper, no recovery.
+    wire_recovered: bool = False
     # Bug K (2026-11-03): True when a warm-resume boundary consumed no wrapper
     # of its own because the child's single terminal wrapper (merged report)
     # was already claimed by an earlier boundary of the same parent —
@@ -1225,6 +1282,7 @@ class DispatchBoundary:
             "t_report_polluted": self.t_report_polluted,
             "t_report_effective": self.t_report_effective,
             "restart_interleaved": self.restart_interleaved,
+            "wire_recovered": self.wire_recovered,
             "shared_desc_match": self.shared_desc_match,
             "snippet_source": self.snippet_source,
             "ncr_char": round(self.ncr_char, 2) if self.ncr_char else None,
@@ -1433,7 +1491,6 @@ def build_economics(
             if tso(s.get("startTime", "")) and is_compaction_span(s, a)
         )
         wire_records = wire_records_of(sid)
-        wire_frames = {str(wr["seq"]): wr["frame"] for wr in wire_records}
         # Bug J (2026-11-03): one parsed, deduped wrapper-occurrence list per
         # wire frame — the ONLY claim currency for async delivery resolution.
         # Raw open-tag str.count also counts truncated remnants (an unclosed
@@ -1769,6 +1826,78 @@ def build_economics(
                         if last_end:
                             terminal_t = last_end
 
+            # --- sync wire-recovery (span result lost) ------------------------
+            # Exporter gap class (2026-11-10, ses_e828c9c15ffe k=27..38): the
+            # sync call returned and the host injected the child's terminal
+            # <subagent state="completed"> wrapper into the parent context,
+            # but the exported TOOL span carries only error.type=interrupted
+            # and NO gen_ai.tool.call.result — booked as report_chars=0 /
+            # status=empty / verdict=UNKNOWN. Evidence gate (same parsed
+            # wrapper currency as the async scan): a NEW terminal-wrapper
+            # occurrence of this child in a frame AFTER the dispatch end,
+            # occurrence-ratcheted past claims so a warm re-dispatch never
+            # re-claims an earlier wrapper. A genuinely aborted child (kill
+            # notice, no wrapper — k=39 ses_e3a9b530a) presents no evidence
+            # and stays empty.
+            if (
+                rec.mode == "sync"
+                and rec.report_delivery == "sync_tool_result"
+                and not result_text.strip()
+                and rec.child_session
+            ):
+                child = rec.child_session
+
+                def _sync_wr_count(idx: int) -> int:
+                    return frame_child_counts[idx].get(child, 0)
+
+                baseline_idx = -1
+                for idx, wr in enumerate(wire_records):
+                    rdt = wr["ts_dt"]
+                    if rdt and t1 and rdt <= t1:
+                        baseline_idx = idx
+                baseline = _sync_wr_count(baseline_idx) if baseline_idx >= 0 else 0
+                claimed = wire_claimed.get(child, 0)
+                # Bug I consistency: claims made before a compaction drop at/
+                # before this dispatch reset to the still-visible count.
+                for drop_ts, new_cnt in child_drops.get(child, ()):
+                    if drop_ts is None or (t1 and drop_ts > t1):
+                        continue
+                    if claimed > new_cnt:
+                        wire_claimed[child] = new_cnt
+                        claimed = new_cnt
+                required = max(baseline + 1, claimed + 1)
+                # never scan past a later re-dispatch of the same child: a
+                # wrapper added there belongs to that boundary, not this one
+                scan_end: datetime | None = None
+                for later, _ in sub_spans[k:]:
+                    lt = tso(later.get("startTime", ""))
+                    lp = dig(_, "tool", "parameters") or {}
+                    later_child = lp.get("sessionID") or lp.get("task_id")
+                    if lt and t1 and lt > t1 and later_child == child:
+                        scan_end = lt
+                        break
+                for idx, wr in enumerate(wire_records):
+                    rdt = wr["ts_dt"]
+                    if not rdt or not t1 or rdt <= t1:
+                        continue
+                    if scan_end is not None and rdt > scan_end:
+                        break
+                    if _sync_wr_count(idx) < required:
+                        continue
+                    hits = [h for h in frame_wrappers[idx] if h["sid"] == child]
+                    hit = hits[required - 1]
+                    if hit["state"] in ("completed", "yielded", "blocked"):
+                        wire_claimed[child] = required
+                        rec.wire_recovered = True
+                        rec.protocol_state = hit["state"]
+                        report_text = hit["report"].strip()
+                        if report_text.startswith("[") or report_text.startswith('"'):
+                            report_text, _ = decode_tool_result(report_text)
+                        result_text = report_text
+                    # a cancelled/non-terminal occurrence at the required
+                    # index is this dispatch's own abort — no recovery
+                    break
+
             # R_k: parent LLM span whose window contains the dispatch start
             if rec.r_k_in is None:
                 for llm_span, llm_attrs in parent_llm:
@@ -1779,7 +1908,9 @@ def build_economics(
                         rec.r_k_reasoning = u["reasoning_output_tokens"]
                         rec.r_k_seq = str(dig(llm_attrs, "opencode", "wire", "seq") or "") or None
                         rec.pre_snippet = snippet(reasoning_text_of(llm_attrs), snippet_len)
-                        body, trunc, src = wire_body(llm_attrs, wire_frames)
+                        body, trunc, src = wire_body(
+                            llm_attrs, llm_span.get("startTime", ""), wire_records
+                        )
                         rec.body_source_k, rec.body_truncated_k = src, trunc
                         break
 
