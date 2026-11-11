@@ -90,7 +90,7 @@ prove context overflow.
 
 ## Part B — Grader & Telemetry Bug Archetypes
 
-Fourteen real measurement bugs fixed in `scripts/phoenix_subagent_usage.py` — plus one scoring clamp removed (entry 15).
+Seventeen real measurement bugs fixed in `scripts/phoenix_subagent_usage.py` — plus one scoring clamp removed (entry 15) and the semconv-alignment wave (entries 16–18).
 Re-check these whenever a scorecard looks damning — the meter breaks more
 often than the prompt.
 
@@ -322,3 +322,81 @@ prompt for `Peak(R)`.
     NetSaved_k monotone in report size. This is the scoring prerequisite
     for the v3.8 no-filter dispatch rule: the meter can now see a
     report that costs more than the noise it filtered.
+
+16. **Sync tool results dropped upstream → completed dispatches booked
+    empty (2026-11-11, commit `fbadcda`)** — nine sync dispatches on
+    `ses_e828c9c15…` (Nov 10) exported TOOL spans carrying only
+    `error: {"type": "interrupted"}` with no `gen_ai.tool.call.result` /
+    `output.value`, and the sync path read the span result with no wire
+    fallback ⇒ `report_chars=0 → status=empty → UNKNOWN` although the full
+    `state="completed"` wrappers sat in the parent wire log. Three stacked
+    defects: (a) the upstream result drop itself (see open items below);
+    (b) the wire frame join was a `{seq: frame}` dict, last-writer-wins
+    across 53 duplicate seq keys — the recorder resets `seq` per instance,
+    so the seq-collision hypothesis was partially right but only fed
+    cosmetic fields; (c) `STATUS_LINE_RE` never matched
+    `**Status**: Completed` (stars between label and colon). Fix:
+    evidence-gated sync wire-recovery (a NEW terminal wrapper occurrence
+    post-t1, occurrence-ratcheted via `wire_claimed`/`child_drops`, scan
+    bounded at the next same-child re-dispatch), the contract join
+    `(opencode.wire.capture_id, seq) ↔ (captureID, seq)` per the
+    exporter's Bug-37 wire-schema contract (legacy spans: seq-among-
+    legacy-records, nearest-ts), and the regex fix. Impact: the nine rows
+    flipped to `1,949–5,131` chars, all `completed/HIGH_GAIN` (three
+    honestly negative NetSaved); historical k=22 (`ses_e799a9c6…`, legacy
+    era) recovered `0→8,419` chars / `MARGINAL_OVERHEAD`; fleet UNKNOWN
+    `17→5`, empty `23→9`, FAILED_DISPATCH unchanged; the genuine user
+    abort k=39 stays `empty` / `wire_recovered=false`.
+
+17. **Heuristic pairing and flush-boundary terminals replaced by native
+    signals (2026-11-11, commit `6a92024`)** — the exporter's post-Nov-6
+    extension attributes became primary sources. `opencode.subagent.
+    session_id` (delegation metadata, exact) now outranks the
+    wrapper→resume→window heuristic chain for child↔dispatch pairing
+    (36/158 rows `delegation_metadata`, 0 conflicts on live data;
+    disagreements surface via `pairing_conflict`, never silently).
+    `opencode.observation.end_source` gates terminal confidence: non-
+    `host_event` sync spans get `protocol_state=None` unless independently
+    wire-recovered or async-resolved — the 10 `low(plugin_flush)` spans
+    are exactly the entry-16 wire-recovered rows, confirming the flush
+    boundary IS the lost-result mechanism. `opencode.observation.
+    end_trigger` yields native per-session `compaction_events` (live enum
+    `session.compaction.ended`; the spec name `compaction_replaced` was
+    not observed — upstream doc/code mismatch, gap-register candidate).
+    `opencode.interrupt.reason` relabels user kills precisely (k=39 now
+    carries `interrupt=['user']`, still empty/non-delivered). Zero
+    verdict changes on non-live rows; absent attributes degrade to legacy
+    behavior, never to false.
+
+18. **Semconv-first consumption replaces plugin-dialect reads
+    (2026-11-11, commit `a635176`)** — governing principle: the exporter
+    and this analyzer each align to the OTel GenAI semconv independently;
+    neither aligns to the other's dialect. Standard shapes are the only
+    primary path: `gen_ai.response.finish_reasons` parsed per `string[]`
+    (the pre-Bug-42 JSON-string form is a labeled `LEGACY-DIALECT SHIM`
+    with a removal note); cache accounting reads `gen_ai.usage.
+    cache_creation.input_tokens` primary with the legacy `cache_write`
+    fallback cross-referenced for one-shot deletion (`cache_read` was
+    already standard). Annotation-only additions (`length_stop_turns`,
+    finish-reason histogram) change no economic math. Reconciliation:
+    323 dual-emit spans, 0 value mismatches — a no-op on current data,
+    future-proof for the exporter's planned legacy-key removal. Findings:
+    fleet finish reasons `tool-calls×4,066 / stop×544 / length×0` — no
+    output truncution anywhere, including two sessions riding 219k+
+    peaks; `ses_e3fb3029b…`'s peak turn (219,198 @ 05:19:08) is itself
+    the compaction turn (next turn 44,663), so context ceilings manifest
+    as compaction replacement, not length stops — Δpeak ceiling-censoring
+    is now machine-distinguishable (peak + `compaction_events` +
+    `length_stop_turns`).
+
+Open upstream items (2026-11-11, exporter repo — requirement reports
+pending, analyzer stopgaps documented above):
+
+- Sync TOOL spans terminate `error.type=interrupted` with no result
+  (post-Bug-37, Nov 10) — the flush-boundary mechanism behind entry 16;
+  the entry-16 wire recovery is the labeled stopgap, not a fix.
+- `compaction_replaced` is documented but `session.compaction.ended` is
+  emitted — one of doc/code is off-contract; the analyzer counts both.
+- C_rework 45.3M bucket contradiction: `ses_e828c9c15…` booked
+  `orphan_aborted_or_dropped` while carrying `interrupt_reasons=['user']`
+  and 43/43 delivered dispatches — separate grader wave, untouched.
