@@ -22,7 +22,7 @@ a prompt without the Phase 5 governance trail.
 
 ## Core References & Paths
 
-- Repo root: `~/yzh/obsystem/react-agent`
+- Repo root: `~/yzh/engineering/obsystem/react-agent`
 - Live runtime prompts (deploy state): `~/.config/opencode/oh-my-opencode-slim/react/{orchestrator,fixer}.md`
 - Wire logs (check capture settings, truncation and missing records): `~/.local/share/opencode/raw-requests/ses_*.jsonl`
 - Theory & methodology:
@@ -50,7 +50,7 @@ interpreting any scorecard, establish which prompt each request actually used:
 Then pull the scorecard:
 
 ```bash
-python3 ~/yzh/obsystem/react-agent/scripts/phoenix_subagent_usage.py \
+python3 ~/yzh/engineering/obsystem/react-agent/scripts/phoenix_subagent_usage.py \
   --project ocg-obs --chars-per-token 2.35 \
   --json-out /tmp/opencode/react-eval.json
 ```
@@ -173,12 +173,12 @@ checks, not all implemented analyzer outputs. Diagnose per cut:
 3. Deploy and verify byte-identity before any evaluation session:
 
 ```bash
-cp ~/yzh/obsystem/react-agent/prompts/orchestrator.md \
-   ~/yzh/obsystem/react-agent/prompts/fixer.md \
+cp ~/yzh/engineering/obsystem/react-agent/prompts/orchestrator.md \
+   ~/yzh/engineering/obsystem/react-agent/prompts/fixer.md \
    ~/.config/opencode/oh-my-opencode-slim/react/ \
-  && diff -u ~/yzh/obsystem/react-agent/prompts/orchestrator.md \
+  && diff -u ~/yzh/engineering/obsystem/react-agent/prompts/orchestrator.md \
              ~/.config/opencode/oh-my-opencode-slim/react/orchestrator.md \
-  && diff -u ~/yzh/obsystem/react-agent/prompts/fixer.md \
+  && diff -u ~/yzh/engineering/obsystem/react-agent/prompts/fixer.md \
              ~/.config/opencode/oh-my-opencode-slim/react/fixer.md
 ```
 
