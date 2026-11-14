@@ -238,3 +238,12 @@ python3 obsystem/react-agent/scripts/phoenix_subagent_usage.py \
    还有一个具体问题：当前计算 (react-agent/scripts/phoenix_subagent_usage.py:2074)把 原始输出量 − 报告量 截成非负数。报告更大时，应该保留负值，才能体现后续父窗口反复携带这些额外内容的成本。
 3. 建立可重复的评估样本，减少事后解释。
    固定几类任务：已知文件读取、小修改、多文件调查、长构建、异步并行；控制模型、起始上下文和验收标准，再比较 inline、v3.6、v3.7。与此同时，把晚到通知、共享报告、序号重置、Code Mode 调用等案例做成脱敏回归样本。
+4. 验证阶段的上下文选择：热会话复用（Warm Reuse）与干净上下文独立审计（Clean-Context Critic）的权衡（参考 Google Research [Advancing science & engineering with Antigravity's `/teamwork`](https://research.google/blog/advancing-science-engineering-with-antigravitys-teamwork-feature/)，2026-11-13）。
+   当前默认在验证或小修阶段复用刚完成实现的同一个 `actor` `sessionID`，以节省重复读盘成本（降低 $\mathrm{RAR}$ / $C_{\text{reload}}$）。但当任务存在确认偏误或“打桩绕过依赖、修改测试迁就坏实现（reward hacking）”风险时，携带原生成者推理链的上下文容易顺着既有盲区自圆其说（推高 $p_{\text{loss}} \cdot C_{\text{risk}}$）。后续可作为研究与迭代方向，按**验证性质**区分两类验证路由并评测其净收益：
+   - **客观机器门禁**（运行既有编译器、未修改的原生测试集、确定性脚本检查）：继续使用 **Warm `sessionID`**，最小化重读成本 $\Delta C_{\text{reload}}$；
+   - **逻辑/事实审计与防篡改验收**（代码与证明审查、核对事实验证、检查测试是否被弱化）：派发**不带原生成者推理历史的 Clean-Context Cold `actor`**（仅传入产物路径、原始需求与锁定验收标准），用可控的读盘开销换取独立证伪能力。
+5. 委派子模式的细粒度原型路由（Pattern Routing：串行精修 vs 并行探索 + 硬证伪器，参考 Antigravity `/teamwork` 与 `/boost`）。
+   当前路由仅划分 **Inline（单文件/零过滤产出）** 与 **Delegate（搜索/多文件/构建测试）** 两档。Antigravity 对历史轨迹的 Token 效率分析表明：紧耦合代码用串行“实现 $\to$ 验证 $\to$ 修订”循环（`/boost`）显著优于并行拆分，而后者的优势在于“多路独立候选 + 客观证伪器（锁定的测试集/形式化检查器/模拟器）”。后续可在受控实验中将委派进一步细分为三类工作流原型分别核算经济账：
+   - **串行精修（Sequential Solve-and-Verify）**：紧耦合模块修改，单泳道迭代并绑定客观门禁，规避跨泳道同步税 $C_{\text{sync}}$ 与冲突返工 $C_{\text{rework}}$；
+   - **并行探索 + 专用证伪器（Parallel Exploration + Dedicated Falsifier）**：高不确定性问题，多路冷会话并行探索，仅凭锁定测试集或硬检查器结果择优晋级；
+   - **生成-审计解耦（Producer + Clean-Context Critic）**：生成会话与独立干净上下文审计会话配对，用于高风险变更或复杂逻辑的终态把关。
