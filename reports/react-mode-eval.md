@@ -278,3 +278,4 @@ $$\underbrace{G_{\text{ctx}} + G_{\text{time}}}_{G_{\text{collab}}\text{（协�
 ## 7. 参考资料
 
 1. 配套实测数据与基准对照见：[react-mode-eval-benchmarks.md](react-mode-eval-benchmarks.md)
+2. 外部研究与社区实践启示（Antigravity `/teamwork`、OpenCode 子代理使用分布等）见：[external-harness-learnings.md](external-harness-learnings.md)
