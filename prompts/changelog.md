@@ -7,6 +7,25 @@ entries are sanitized of private paths, credentials, and raw user transcripts.
 
 ---
 
+## v3.11 — `orchestrator.md` & `fixer.md`: Reasoner-Owned Logical Review vs. Actor Evidence Collection, Single-Sweep Saturation Guard, and Semantic-Only Line Breaks
+
+- **Date**: 2026-11-17
+- **Files Changed**: `prompts/orchestrator.md` (role header, `Context-Economic Routing`, `ReAct Collaboration Loop` Steps 2 & 3, semantic-only line breaks), `prompts/fixer.md` (`On Verification` evidence handoff, `## Report Contract` heading replacing XML tags, semantic-only line breaks)
+- **Trigger / Evidence**:
+  1. **Cut A reasoning trace on delegated design/code review (`ses_e1781eb0affe…`, `2026-11-17`)**: After `k=1` migrated 4 header files (`ses_e177dd563f…`), Reasoner deliberated before `k=2`: *"Should inspect changes/diff myself perhaps dispatch design verification actor… According loop, once lane reports compare against global plan define concrete verification and dispatch actor… Could call shell git diff --stat… but instructions say delegate multi-file. Better design actor."* Reasoner then spawned a cold `actor` (`ses_e177703f1f…`) to review the design (`70` tool calls), and—because a second-hand review summary could not substitute for direct architectural understanding when planning the `k=3` fix—**still had to read the mechanism plan and `.hpp` files into the parent window itself before `k=3`** (`in(R)` jumped from `25,926` to `54,064` tok), paying both the 70-tool child review cost and the parent inline read cost.
+  2. **Root causes across `v2.0 → v3.10` history**:
+     - **Mechanical keyword trigger (`multi-file changes`)**: conflated disposable intermediate process noise (multi-file edit/build loops, open-ended search) with high-signal target diffs/files that Reasoner needs in its own head to judge logic and plan fixes;
+     - **Mandatory verification delegation in Step 2 (`Synchronize & Verify`)**: phrased verification as *"dispatch `actor` to run them"*, causing ritual verification dispatches (`k=4`) and outsourcing architectural/logical judgment to the execution tier;
+     - **Single-sweep saturation blind spot in Step 3 (`heavy multi-round history`)**: `k=2` ran `70` tool calls in a single turn (`~200k` raw chars), so Reasoner did not recognize it as "multi-round" and warm-reused `ses_e177703f1f…` in `k=4`, pushing child peak context to `152,737` tok (`> \tau_{\text{rotate}} = 120\text{k}$ `⚠CHILD_OVERLOADED`).
+  3. **Structural formatting cleanup**: removed cosmetic ~80-column hard line wraps across both `orchestrator.md` (`52 → 16` lines) and `fixer.md` (`38 → 18` lines) so line breaks strictly reflect semantic structure (headings, paragraphs, list items), and replaced the residual `<Report Contract>` XML tags in `fixer.md` with `## Report Contract` (matching `v3.7`'s Markdown unification).
+- **Target Economics / Boundary**:
+  - Targets **Cut A / Cut C cognitive division of labor** ($C_{\text{tx}}$, $C_{\text{state}}$, and $C_{\text{risk}}$ vs $G_{\text{ctx}}$): keep disposable process noise (open-ended exploration, multi-file implementation loops, build/test suites, broad mechanical sweeps) inside `actor` while keeping bounded target-file/diff inspection for logical and architectural review inline in Reasoner—eliminating "delegate review then re-read inline anyway" double taxation while guarding against the `v3.3` self-bootstrapping inline-edit cascade ("the moment an inline step fails, needs diagnostic probing, or turns into multi-file edits, hand the full execution or diagnosis-and-fix loop to `actor`").
+  - Broadens Step 3 cold rotation from `heavy multi-round history` to `heavy history (across multiple rounds or a single large sweep)` to bound child $\mathrm{Peak}(A) \le \tau_{\text{rotate}}$.
+- **Expected Metric Impact**:
+  - **M1 / M4 ($\mathrm{NCR}$, $\mathrm{NetSaved}_k$, $\Delta\mathrm{Peak}_{\text{self}}$)**: eliminate redundant review-then-parent-reread double billing and ritual post-implementation verify dispatches when the implementation report already includes acceptance evidence.
+  - **M3 / M6 ($C_{\text{escape}}$, $p_{\text{loss}}$)**: keep logical/architectural acceptance judgment in the higher-reasoning parent window without reopening multi-file inline edit escapes.
+  - **M4 / Child Saturation ($\mathrm{Peak}(A)$)**: trigger cold rotation after single-round large sweeps (`>40–70` tools) before crossing `120k` tokens.
+
 ## v3.10 — orchestrator.md: Whole-Loop Noise Forecast & First-Probe Handoff on Surprise
 
 - **Date**: 2026-11-08
